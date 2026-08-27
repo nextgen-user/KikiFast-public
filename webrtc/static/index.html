@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#000000" />
+  <title>KikiFast Stream</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- Tap-to-start gate: required so getUserMedia / fullscreen / wake-lock /
+       motion-sensor permission all happen inside a user gesture. -->
+  <div id="gate">
+    <h1>Hello World</h1>
+    <p>KikiFast camera &amp; mic link</p>
+    <button id="startBtn" class="big">▶ Start Stream</button>
+  </div>
+
+  <main id="stage" class="hidden">
+    <!-- local camera preview, full screen -->
+    <video id="preview" autoplay playsinline muted></video>
+    <!-- remote audio from the RPi (speaker output) -->
+    <audio id="remote" autoplay></audio>
+
+    <div id="hud">
+      <span id="status" class="pill">connecting…</span>
+      <span id="sensorReadout" class="pill mono">gyro —</span>
+    </div>
+
+    <div id="controls">
+      <h2 class="hello">Hello World 👋</h2>
+      <div class="row">
+        <button class="mock" data-name="flip" id="flipBtn">🔄 Flip Cam</button>
+        <button class="mock" data-name="mute" id="muteBtn">🎙️ Mute</button>
+        <button class="mock" data-name="fs" id="fsBtn">⛶ Fullscreen</button>
+      </div>
+      <div class="row">
+        <button class="mock" data-name="action_a">Button A</button>
+        <button class="mock" data-name="action_b">Button B</button>
+        <button class="mock" data-name="action_c">Button C</button>
+      </div>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

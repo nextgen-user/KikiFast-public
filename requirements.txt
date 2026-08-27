@@ -1,0 +1,22 @@
+# KikiFast dependencies — versions pinned from the production venv (/srv/kikifast/.venv)
+python-dotenv==1.2.1
+requests==2.32.5
+numpy==2.2.6
+PyAudio==0.2.14
+pyrnnoise==0.4.3
+openwakeword==0.6.0
+onnxruntime==1.23.1
+deepgram-sdk==6.0.1
+litellm==1.82.3
+google-genai==1.60.0
+openai==2.14.0
+groq==1.0.0
+opencv-python==4.12.0.88
+tiktoken==0.12.0
+exa-py==2.9.0
+pillow==12.0.0
+pyzmq==27.1.0
+pyserial==3.5
+gpiod==2.4.0
+mcp==1.25.0
+websockets==15.0.1

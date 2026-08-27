@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+.env
+conversations/
+conversation_summary.txt
+thinking_journal.json
+ambient_listen_buffer.json
+knowledge_base.json
+workers.json
+image.jpeg
+*.wav
+!sound_effects/soundeffects/startup_config_beep.wav
+*.cache
+tools_and_config/lcd_sync_calibration.json
+*.log
+*.pid
+.tiktoken_cache/
+care_plan.json
+
+# Machine-written files: these change without anyone editing them, so their
+# worktree copy drifts from whatever git has committed. That is the class that
+# turned a brownout into unrecoverable object-DB loss on 2026-07-30 — a lost
+# blob for a source file can always be restored from disk with
+# `git hash-object -w`, but not one whose content has since been rewritten.
+# Keep them untracked so a power cut can only ever cost recoverable data.
+*.log.*
+logs/
+*.jsonl
+kiki_speeches/
+
+# Downloaded toolchains/archives — refetchable, and a 62MB blob makes every
+# `git gc` repack a long window of writing on an SD card.
+/go*.tar.gz
+*.tar.gz

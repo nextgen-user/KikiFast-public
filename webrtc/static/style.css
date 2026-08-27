@@ -1,0 +1,102 @@
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+  height: 100%;
+  background: #000;
+  color: #fff;
+  font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+.hidden { display: none !important; }
+
+/* ---- start gate ---- */
+#gate {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  text-align: center;
+  background: radial-gradient(circle at 50% 30%, #1b2a4a, #000);
+}
+#gate h1 { font-size: 2.4rem; }
+#gate p { opacity: .7; }
+
+.big {
+  font-size: 1.3rem;
+  padding: 16px 32px;
+  border: none;
+  border-radius: 14px;
+  background: #2f6fed;
+  color: #fff;
+  font-weight: 600;
+}
+.big:active { transform: scale(.97); }
+
+/* ---- stage / video ---- */
+#stage { position: fixed; inset: 0; }
+
+#preview {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;       /* full screen, no letterbox */
+  background: #000;
+}
+
+/* ---- HUD (top) ---- */
+#hud {
+  position: absolute;
+  top: calc(env(safe-area-inset-top) + 10px);
+  left: 10px;
+  right: 10px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  pointer-events: none;
+}
+.pill {
+  background: rgba(0,0,0,.55);
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: .8rem;
+  backdrop-filter: blur(6px);
+}
+.pill.ok    { background: rgba(28,160,80,.7); }
+.pill.bad   { background: rgba(200,40,40,.7); }
+.mono { font-variant-numeric: tabular-nums; }
+
+/* ---- controls (bottom) ---- */
+#controls {
+  position: absolute;
+  left: 0; right: 0;
+  bottom: calc(env(safe-area-inset-bottom) + 14px);
+  padding: 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: center;
+}
+.hello {
+  font-size: 1.4rem;
+  text-shadow: 0 2px 8px rgba(0,0,0,.8);
+}
+.row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+
+.mock {
+  border: none;
+  border-radius: 12px;
+  padding: 14px 18px;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(255,255,255,.14);
+  backdrop-filter: blur(8px);
+  min-width: 96px;
+}
+.mock:active { transform: scale(.95); background: rgba(255,255,255,.28); }
+.mock.active { background: #2f6fed; }
