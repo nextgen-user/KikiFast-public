@@ -1620,6 +1620,82 @@ only while LEFT is held and runs local whisper.cpp after release. Pure helpers
 `parse_nmcli_networks` and `apply_password_dictation` contain the escaped-SSID and spoken
 character/edit parsing logic and are covered by `tests/test_wifi_setup.py`.
 
+### 5.18g `scripts/power_blackbox.py` — why the Pi died
+
+A 1 Hz flight recorder for power and thermal state, run by
+`kiki-power-blackbox.service` (installed in `/etc/systemd/system/`, ordered
+`Before=kikifast.service` so it is already recording when Kiki pulls up the Hailo
+NPU, camera and TTS servers — the current spike a marginal supply dies on).
+Samples land in `/var/log/kiki-power-blackbox.csv`; read them back with:
+
+```bash
+./scripts/power_blackbox.py --report          # verdict per boot session
+sudo systemctl disable --now kiki-power-blackbox.service   # stop recording
+```
+
+Three failure modes look identical from a terminal after the fact, so the
+recorder is built to separate them:
+
+| Signature | Cause |
+|---|---|
+| No `#STOP`, samples evenly spaced, EXT5V sagging or under-voltage bit set | **Brownout** — supply/cable cannot hold 5 V |
+| No `#STOP`, `late_s` growing beforehand, next boot's `rsts`/`wd_bootstatus` differ from baseline | **Watchdog reset** — PID 1 stalled past the 60s hardware timeout (`RuntimeWatchdogSec=1m`); a software hang, not power |
+| `#STOP` present, `temp_c` ≥ 80 with throttle bits | **Thermal** — a thermal poweroff is still orderly |
+| `#STOP` present, voltage and temperature normal | **Software / OOM** |
+
+Two design points are load-bearing:
+
+- **The `#STOP` marker.** systemd sends SIGTERM on every orderly shutdown, so
+  its *absence* proves the board was cut off rather than shut down. Every sample
+  is `fsync`ed for the same reason: the last line before a hard cut is the whole
+  point, and a buffered write would lose exactly that line.
+- **`late_s` and the reset registers.** A brownout and a watchdog reset are
+  indistinguishable from userspace — both just stop. But the watchdog can only
+  fire after PID 1 stalls for 60s, and that stall shows up first as the sampler
+  falling behind schedule. Each `#BOOT` marker also records `vcgencmd get_rsts`
+  and `/sys/class/watchdog/watchdog0/bootstatus` verbatim (not decoded — the
+  RSTS layout varies by model); a session that ended `CLEAN` supplies the
+  known-good baseline the next boot is compared against.
+
+Journald on Raspberry Pi OS ships `Storage=volatile`
+(`/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`) to spare the SD
+card, which throws away the log of the boot that died. `/etc/systemd/journald.conf.d/99-kiki-persistent.conf`
+overrides it to `persistent` with a 400 MB cap. Delete that file and restart
+`systemd-journald` to go back.
+
+### 5.18h `kiki-cpu-cap.service` — trimming peak SoC current
+
+A systemd oneshot that caps all four cores at **2200 MHz** (they share
+`cpufreq/policy0`), applied `Before=kikifast.service` so the cap is already in
+force during the heaviest part of startup.
+
+The number is not arbitrary. Measured on this board under a 4-core busy load:
+
+| Cap | VDD_CORE | Power | vs 2400 |
+|---|---|---|---|
+| 2400 MHz | 5.315 A | 4.63 W | — |
+| **2200 MHz** | 4.451 A | **3.76 W** | **−19% power for −8% clock** |
+| 2000 MHz | 4.158 A | 3.39 W | −27% power for −17% clock |
+| 1800 MHz | 3.692 A | 2.92 W | −37% power for −25% clock |
+
+2400 MHz is a boost bin — the firmware raises core voltage to reach it, so the
+last 8% of clock costs a fifth of the SoC's power. Capping one step below is by
+far the best power-per-clock trade available, and the saving compounds because
+the voltage drops with it (0.846 V capped vs 0.870 V uncapped).
+
+Tuning is one number in `ExecStart`, then `systemctl restart kiki-cpu-cap`.
+`systemctl stop` restores `cpuinfo_max_freq`, so the change is reversible with
+no reboot and nothing to undo. For a cap that applies from the very first
+instant of firmware boot instead, `arm_freq=2200` in `/boot/firmware/config.txt`
+does the same thing but needs a reboot to change.
+
+This exists because the Pi hard-cuts under combined load (§5.18g): the failure
+captured so far was at the Hailo + webcam bring-up, and it also happens mid-
+conversation with the MCP server, webcam and neck stepper active. Frequency
+capping is the only lever that reduces *actual* draw without giving up a
+peripheral — `usb_max_current_enable` only caps what the Pi will supply, and
+with a single webcam on USB there is little there to reclaim.
+
 ### 5.19 `tests/streaming_tts.py` (≈500 lines)
 
 Self-contained gapless streaming-TTS library (mirrors `core/tts.py` LocalTTSStreamer
