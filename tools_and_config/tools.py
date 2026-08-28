@@ -1544,6 +1544,32 @@ async def self_extend_install_smithery_skill(identifier: str) -> str:
 # Senior Citizen Mode Tools (care plan + family email)
 # ============================================================================
 
+def _normalize_spoken_care_schedule(value: Any) -> Any:
+    """Turn the compact time shapes used by the speaking model into a schedule.
+
+    The local tool instruction only exposes ``data:obj`` to stay prompt-light,
+    so the model commonly emits ``"schedule": "19:20"`` or a separate
+    ``"time": "08:00 AM"``. Both are unambiguous daily schedules and should
+    not be rejected merely because the model omitted the canonical wrapper.
+    Unknown shapes are returned unchanged so the strict store still rejects
+    them instead of guessing.
+    """
+    if isinstance(value, dict) or value in (None, ""):
+        return value
+    text = str(value).strip()
+    for fmt in ("%H:%M", "%I:%M %p", "%I %p"):
+        try:
+            hhmm = datetime.strptime(text.upper(), fmt).strftime("%H:%M")
+            return {"kind": "daily", "value": hhmm}
+        except ValueError:
+            pass
+    try:
+        datetime.fromisoformat(text)
+        return {"kind": "once", "value": text}
+    except ValueError:
+        return value
+
+
 async def update_care_plan(section: str, action: str, data: Any = None) -> str:
     """Create or edit the caregiver care plan (voice-first) and re-sync workers.
 
@@ -1598,6 +1624,33 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
         if not isinstance(d, dict):
             return "ERROR: No change was saved. 'data' must be a JSON object."
 
+        # Normalize the small, predictable variants the speaking model uses.
+        # This includes both live failures: task/time keys and a bare HH:MM
+        # schedule. Original Hindi text is preserved verbatim.
+        if section == "reminder":
+            if not d.get("message"):
+                d["message"] = d.get("task") or d.get("text") or ""
+            if not d.get("schedule") and d.get("time"):
+                d["schedule"] = d["time"]
+            if "schedule" in d:
+                d["schedule"] = _normalize_spoken_care_schedule(d["schedule"])
+        elif section == "exercise" and action == "add":
+            if not d.get("schedule") and d.get("time"):
+                d["schedule"] = d["time"]
+            if "schedule" in d:
+                d["schedule"] = _normalize_spoken_care_schedule(d["schedule"])
+            # "Remind me to exercise" is a reminder, not a guided routine. The
+            # model used the exercise section with reminder-shaped fields in the
+            # live test; route that intent to a real schedulable reminder.
+            if d.get("message") and not d.get("name") and not d.get("steps"):
+                d = {
+                    "category": "exercise",
+                    "message": d["message"],
+                    "schedule": d.get("schedule"),
+                    "enabled": d.get("enabled", True),
+                }
+                section = "reminder"
+
         allowed_actions = {
             "reminder": {"add", "edit", "remove"},
             "exercise": {"add", "edit", "remove"},
@@ -1625,12 +1678,14 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
                         "{'kind':'daily','value':'HH:MM'} after the user answers.")
         ok = True
         msg = ""
+        scheduled_item_id = ""
 
         if section == "reminder":
             if action == "add":
                 item = plan.add_reminder(d.get("category", "other"), d.get("message", ""),
                                          d.get("schedule", {}), d.get("enabled", True))
                 msg = f"Added {item['category']} reminder (id {item['id']})."
+                scheduled_item_id = item["id"]
             elif action == "edit":
                 ok = plan.edit_reminder(d.get("id", ""), **{k: v for k, v in d.items() if k != "id"})
                 msg = "Reminder updated." if ok else "No reminder with that id."
@@ -1643,6 +1698,7 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
                                          d.get("schedule"), d.get("prescribed_by", ""),
                                          d.get("enabled", True))
                 msg = f"Added exercise '{item['name']}' (id {item['id']})."
+                scheduled_item_id = item["id"] if item.get("schedule") else ""
             elif action == "edit":
                 ok = plan.edit_exercise(d.get("id", ""), **{k: v for k, v in d.items() if k != "id"})
                 msg = "Exercise updated." if ok else "No exercise with that id."
@@ -1670,15 +1726,25 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
             plan.add_care_log(d.get("kind", "note"), d.get("text", ""))
             msg = "Care log entry added."
         # Re-sync workers so schedule changes take effect immediately.
+        sync_problem = ""
         try:
             mgr = get_senior_care_manager()
             if mgr is not None and mgr.is_active():
                 mgr.sync_workers()
+                if (scheduled_item_id and hasattr(mgr, "is_item_scheduled")
+                        and not mgr.is_item_scheduled(scheduled_item_id)):
+                    sync_problem = (
+                        f"Care item {scheduled_item_id} was saved, but its worker "
+                        "was not scheduled.")
         except Exception as e:
             print(f"[update_care_plan] sync failed: {e}")
+            if scheduled_item_id:
+                sync_problem = f"Care item was saved, but worker sync failed: {e}"
 
         if not ok:
             return f"ERROR: No change was saved. {msg or 'No change made.'}"
+        if sync_problem:
+            return f"PARTIAL: {sync_problem} Do not promise that it will trigger."
         return f"SUCCESS: {msg or 'Care plan updated.'}"
     except ValueError as e:
         return f"ERROR: No change was saved. {e}"

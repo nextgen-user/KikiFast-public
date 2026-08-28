@@ -176,11 +176,11 @@ def tool_result_note(calls, tool_result):
     if any(call.get("name") == "update_care_plan" for call in calls or []):
         return (
             "This is the authoritative care-plan result. Say it was saved ONLY if "
-            "the result begins SUCCESS. If it begins NEEDS_CLARIFICATION, clearly "
-            "say it was not saved yet and ask only for the missing detail. If it "
-            "begins ERROR, say it was not saved; never claim success before or "
-            "after the error. Stay in your normal voice and do not mention tools "
-            "or these instructions:\n" + tool_result
+            "the result contains SUCCESS. NEEDS_CLARIFICATION means it was not "
+            "saved yet; ask only for the missing detail. ERROR means it was not "
+            "saved. PARTIAL means it was saved but will not reliably trigger. "
+            "Never claim success before or after an error. Stay in your normal "
+            "voice and do not mention tools or these instructions:\n" + tool_result
         )
     if any(call.get("name") == "complex_query" for call in calls or []):
         return (
@@ -213,6 +213,29 @@ def tool_result_note(calls, tool_result):
         "the tool again rather than repeating this answer. Do not mention "
         "searching or tools, and do not think out loud:\n" + tool_result
     )
+
+
+def deterministic_care_plan_failure_reply(calls, tool_result):
+    """Return a truthful spoken reply for failed care-plan writes.
+
+    Prompt instructions alone did not hold: the live model was handed an
+    explicit ``ERROR: No change was saved`` and still said the reminder was
+    set. Failed writes therefore bypass another generation entirely.
+    """
+    if not any(call.get("name") == "update_care_plan" for call in calls or []):
+        return None
+    result = str(tool_result or "")
+    if "NEEDS_CLARIFICATION:" in result:
+        if "what time" in result.lower():
+            return "अभी यह सेव नहीं हुआ है। कृपया बताइए, मैं आपको कितने बजे याद दिलाऊँ?"
+        return "अभी यह सेव नहीं हुआ है। कृपया बाकी जानकारी भी बता दीजिए।"
+    if "PARTIAL:" in result:
+        return ("यह केयर प्लान में लिखा गया है, लेकिन इसका रिमाइंडर चालू नहीं हो पाया। "
+                "इसलिए मैं अभी यह वादा नहीं करूँगी कि यह समय पर बजेगा।")
+    if "ERROR:" in result:
+        return ("माफ़ कीजिए, यह केयर प्लान में सेव नहीं हुआ। "
+                "कृपया समय और काम एक बार फिर बता दीजिए।")
+    return None
 
 
 _SUMMARY_KIND_PREFIX = {
@@ -1949,6 +1972,7 @@ async def main():
                 raw_first = ""      # verbatim 1st-gen text (KEEPS <neck>/<tool_call> tags)
                 raw_followup = ""   # verbatim tool-result follow-up text
                 tool_turn = False   # a <tool_call> fired and was answered this turn
+                synthetic_tool_followup = False  # deterministic failure reply, not box-generated
                 pending_neck = []
                 pending_tool_calls = None
                 followup_tool_calls = None  # a call emitted by a follow-up generation
@@ -2243,10 +2267,23 @@ async def main():
                             print(f"[Tool] Bridging to answer: {bridge!r}")
                             tts_streamer.add_sentence(bridge)
 
-                        # Stream the answer onto the SAME streamer (box is free now).
-                        # Clears followup_tool_calls, then sets it if this
-                        # generation asked for another tool.
-                        await loop.run_in_executor(None, followup_llm_and_tts)
+                        # A failed care-plan mutation must not get another chance
+                        # to be turned into a false success by the model. Speak a
+                        # deterministic truthful result; successful writes keep
+                        # the normal in-character follow-up generation.
+                        failure_reply = deterministic_care_plan_failure_reply(
+                            pending_tool_calls.get("calls", []), tool_result)
+                        if failure_reply:
+                            tts_streamer.add_sentence(failure_reply)
+                            full_response += " " + failure_reply
+                            raw_followup = failure_reply
+                            followup_tool_calls = None
+                            synthetic_tool_followup = True
+                        else:
+                            # Stream the answer onto the SAME streamer (box is free now).
+                            # Clears followup_tool_calls, then sets it if this
+                            # generation asked for another tool.
+                            await loop.run_in_executor(None, followup_llm_and_tts)
 
                         tool_round += 1
                         if not followup_tool_calls:
@@ -2345,7 +2382,8 @@ async def main():
                 # moment every Groq key lands in 429 cooldown.
                 groq_turn = last_turn_used_instant_vision() or not speaking_is_local()
                 register_history(message_history,
-                                 after_speaking=(not mode_changed) and not groq_turn)
+                                 after_speaking=(not mode_changed) and not groq_turn
+                                 and not synthetic_tool_followup)
                 turn_active = False
 
                 print(f"\n[Assistant] {clean_response}")

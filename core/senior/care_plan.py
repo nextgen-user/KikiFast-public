@@ -196,17 +196,34 @@ class CarePlan:
 
     def add_exercise(self, name: str, steps: List[str], schedule: Optional[Dict[str, Any]] = None,
                      prescribed_by: str = "", enabled: bool = True) -> Dict[str, Any]:
+        name = str(name or "").strip()
+        steps = [str(s).strip() for s in (steps or []) if str(s).strip()]
+        if not name:
+            raise ValueError("exercise name is required")
+        if not steps:
+            raise ValueError("a guided exercise requires at least one step")
+        normalized_schedule = _normalize_schedule(schedule) if schedule else {}
+        if schedule and not _valid_schedule(normalized_schedule):
+            raise ValueError(
+                "a valid exercise schedule must be daily HH:MM, recurring "
+                "positive seconds, or once ISO datetime")
         item = {
             "id": uuid.uuid4().hex[:8],
-            "name": str(name or "").strip(),
-            "steps": [str(s).strip() for s in (steps or []) if str(s).strip()],
-            "schedule": _normalize_schedule(schedule) if schedule else {},
+            "name": name,
+            "steps": steps,
+            "schedule": normalized_schedule,
             "prescribed_by": str(prescribed_by or "").strip(),
             "enabled": bool(enabled),
         }
         with self._lock:
             self.data.setdefault("exercises", []).append(item)
-        self.save()
+        if not self.save():
+            with self._lock:
+                self.data["exercises"] = [
+                    existing for existing in self.data.get("exercises", [])
+                    if existing.get("id") != item["id"]
+                ]
+            raise IOError("could not persist exercise")
         return item
 
     def edit_exercise(self, exercise_id: str, **fields) -> bool:

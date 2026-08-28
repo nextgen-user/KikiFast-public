@@ -68,6 +68,19 @@ class SeniorCareManager:
             return 0
         return self.activate()
 
+    def is_item_scheduled(self, item_id: str) -> bool:
+        """Return whether an active worker exists for one care-plan item."""
+        suffix = f":{item_id}"
+        try:
+            return any(
+                worker.name.startswith(_WORKER_PREFIX)
+                and worker.name.endswith(suffix)
+                and worker.is_active()
+                for worker in self.wm.list_workers(include_completed=True)
+            )
+        except Exception:
+            return False
+
     # --------------------------------------------------------------- internal
     def _clear_existing(self) -> None:
         try:
