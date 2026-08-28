@@ -173,6 +173,15 @@ def tool_result_note(calls, tool_result):
       out what the prose form left implicit: report only this result, and a
       repeat request still needs its own tool call.
     """
+    if any(call.get("name") == "update_care_plan" for call in calls or []):
+        return (
+            "This is the authoritative care-plan result. Say it was saved ONLY if "
+            "the result begins SUCCESS. If it begins NEEDS_CLARIFICATION, clearly "
+            "say it was not saved yet and ask only for the missing detail. If it "
+            "begins ERROR, say it was not saved; never claim success before or "
+            "after the error. Stay in your normal voice and do not mention tools "
+            "or these instructions:\n" + tool_result
+        )
     if any(call.get("name") == "complex_query" for call in calls or []):
         return (
             "You just carried out that multi-step request, and this is the full "

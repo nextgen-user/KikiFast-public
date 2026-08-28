@@ -152,20 +152,43 @@ class CarePlan:
         category = (category or "other").strip().lower()
         if category not in VALID_REMINDER_CATEGORIES:
             category = "other"
+        message = str(message or "").strip()
+        if not message:
+            raise ValueError("reminder message is required")
         schedule = _normalize_schedule(schedule)
+        if not _valid_schedule(schedule):
+            raise ValueError(
+                "a valid reminder schedule is required: daily HH:MM, "
+                "recurring positive seconds, or once ISO datetime")
         item = {
             "id": uuid.uuid4().hex[:8],
             "category": category,
-            "message": str(message or "").strip(),
+            "message": message,
             "schedule": schedule,
             "enabled": bool(enabled),
         }
         with self._lock:
             self.data.setdefault("reminders", []).append(item)
-        self.save()
+        if not self.save():
+            with self._lock:
+                self.data["reminders"] = [
+                    existing for existing in self.data.get("reminders", [])
+                    if existing.get("id") != item["id"]
+                ]
+            raise IOError("could not persist reminder")
         return item
 
     def edit_reminder(self, reminder_id: str, **fields) -> bool:
+        if "message" in fields:
+            fields["message"] = str(fields["message"] or "").strip()
+            if not fields["message"]:
+                raise ValueError("reminder message cannot be empty")
+        if "schedule" in fields:
+            fields["schedule"] = _normalize_schedule(fields["schedule"])
+            if not _valid_schedule(fields["schedule"]):
+                raise ValueError(
+                    "a valid reminder schedule is required: daily HH:MM, "
+                    "recurring positive seconds, or once ISO datetime")
         return self._edit_item("reminders", reminder_id, fields)
 
     def remove_reminder(self, reminder_id: str) -> bool:
@@ -286,7 +309,22 @@ def _valid_schedule(schedule: Any) -> bool:
     if not isinstance(schedule, dict):
         return False
     kind = schedule.get("kind")
-    return kind in VALID_SCHEDULE_KINDS and bool(schedule.get("value") not in (None, ""))
+    value = schedule.get("value")
+    if kind == "recurring":
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    if kind == "daily":
+        try:
+            datetime.strptime(str(value), "%H:%M")
+            return True
+        except (TypeError, ValueError):
+            return False
+    if kind == "once":
+        try:
+            datetime.fromisoformat(str(value))
+            return True
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 def _normalize_schedule(schedule: Any) -> Dict[str, Any]:
@@ -296,12 +334,24 @@ def _normalize_schedule(schedule: Any) -> Dict[str, Any]:
     kind = str(schedule.get("kind", "")).strip().lower()
     value = schedule.get("value")
     if kind == "recurring":
+        if isinstance(value, bool):
+            return {}
         try:
             value = int(value)
         except (TypeError, ValueError):
-            value = 3600
-    elif kind in ("daily", "once"):
+            return {}
+    elif kind == "daily":
         value = str(value or "").strip()
+        try:
+            value = datetime.strptime(value, "%H:%M").strftime("%H:%M")
+        except ValueError:
+            return {}
+    elif kind == "once":
+        value = str(value or "").strip()
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return {}
     else:
         return {}
     return {"kind": kind, "value": value}

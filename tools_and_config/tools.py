@@ -1544,7 +1544,7 @@ async def self_extend_install_smithery_skill(identifier: str) -> str:
 # Senior Citizen Mode Tools (care plan + family email)
 # ============================================================================
 
-async def update_care_plan(section: str, action: str, data: str = "") -> str:
+async def update_care_plan(section: str, action: str, data: Any = None) -> str:
     """Create or edit the caregiver care plan (voice-first) and re-sync workers.
 
     section: reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log
@@ -1563,6 +1563,22 @@ async def update_care_plan(section: str, action: str, data: str = "") -> str:
         from core.senior.senior_care_manager import get_senior_care_manager
         plan = get_care_plan_store()
 
+        section = (section or "").strip().lower()
+        action = (action or "").strip().lower()
+        section = {
+            "reminders": "reminder",
+            "exercises": "exercise",
+            "family_contacts": "family_contact",
+            "contacts": "family_contact",
+            "profile": "senior",
+            "care_logs": "care_log",
+        }.get(section, section)
+        action = {
+            "create": "add",
+            "update": "edit",
+            "delete": "remove",
+        }.get(action, action)
+
         d: Dict[str, Any] = {}
         if isinstance(data, dict):
             d = data
@@ -1570,10 +1586,43 @@ async def update_care_plan(section: str, action: str, data: str = "") -> str:
             try:
                 d = json.loads(data)
             except json.JSONDecodeError:
-                return f"Error: 'data' must be a JSON object. Got: {data!r}"
+                # Compatibility for the exact live failure where the model sent
+                # a spoken reminder as raw Hindi instead of an object. Keep the
+                # original Unicode text for natural Hindi TTS; LCD rendering
+                # already derives Hinglish through romanize_hindi_for_lcd().
+                if section == "reminder" and action == "add":
+                    d = {"message": str(data).strip()}
+                else:
+                    return ("ERROR: No change was saved. 'data' must be a JSON "
+                            f"object, not {data!r}.")
+        if not isinstance(d, dict):
+            return "ERROR: No change was saved. 'data' must be a JSON object."
 
-        section = (section or "").strip().lower()
-        action = (action or "").strip().lower()
+        allowed_actions = {
+            "reminder": {"add", "edit", "remove"},
+            "exercise": {"add", "edit", "remove"},
+            "family_contact": {"add", "remove"},
+            "approved_music": {"add", "remove"},
+            "approved_topics": {"add", "remove"},
+            "senior": {"set", "edit"},
+            "care_log": {"add"},
+        }
+        if section not in allowed_actions:
+            return (f"ERROR: No change was saved. Unknown section '{section}'. Use "
+                    "reminder, exercise, family_contact, approved_music, "
+                    "approved_topics, senior, or care_log.")
+        if action not in allowed_actions[section]:
+            return (f"ERROR: No change was saved. Action '{action}' is not valid "
+                    f"for section '{section}'.")
+
+        if section == "reminder" and action == "add":
+            if not str(d.get("message", "")).strip():
+                return ("NEEDS_CLARIFICATION: No reminder was saved. Ask what the "
+                        "reminder should say.")
+            if not d.get("schedule"):
+                return ("NEEDS_CLARIFICATION: No reminder was saved. Ask what time "
+                        "it should run. For a daily reminder, save schedule as "
+                        "{'kind':'daily','value':'HH:MM'} after the user answers.")
         ok = True
         msg = ""
 
@@ -1620,10 +1669,6 @@ async def update_care_plan(section: str, action: str, data: str = "") -> str:
         elif section == "care_log":
             plan.add_care_log(d.get("kind", "note"), d.get("text", ""))
             msg = "Care log entry added."
-        else:
-            return (f"Unknown section '{section}'. Use one of: reminder, exercise, "
-                    "family_contact, approved_music, approved_topics, senior, care_log.")
-
         # Re-sync workers so schedule changes take effect immediately.
         try:
             mgr = get_senior_care_manager()
@@ -1632,9 +1677,13 @@ async def update_care_plan(section: str, action: str, data: str = "") -> str:
         except Exception as e:
             print(f"[update_care_plan] sync failed: {e}")
 
-        return msg or ("Done." if ok else "No change made.")
+        if not ok:
+            return f"ERROR: No change was saved. {msg or 'No change made.'}"
+        return f"SUCCESS: {msg or 'Care plan updated.'}"
+    except ValueError as e:
+        return f"ERROR: No change was saved. {e}"
     except Exception as e:
-        return f"Error updating care plan: {e}"
+        return f"ERROR: No change was saved. Error updating care plan: {e}"
 
 
 async def get_care_plan(section: str = "") -> str:
@@ -2653,7 +2702,7 @@ TOOLS = [
                 "properties": {
                     "section": {"type": "string", "description": "reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"},
                     "action": {"type": "string", "description": "add | edit | remove | set"},
-                    "data": {"type": "string", "description": "JSON object of fields. e.g. reminder add: {\"category\":\"medicine\",\"message\":\"BP pill\",\"schedule\":{\"kind\":\"daily\",\"value\":\"09:00\"}}. schedule.kind is daily(value HH:MM) | recurring(value seconds) | once(value ISO datetime)."}
+                    "data": {"type": "object", "description": "Fields for the chosen section. Reminder add requires message and schedule, e.g. {\"category\":\"medicine\",\"message\":\"BP pill\",\"schedule\":{\"kind\":\"daily\",\"value\":\"09:00\"}}. Preserve the user's original language. schedule.kind is daily(value HH:MM) | recurring(value positive seconds) | once(value ISO datetime)."}
                 },
                 "required": ["section", "action"]
             }
@@ -2792,6 +2841,26 @@ def validate_tool_arguments(name: str, arguments: dict) -> tuple[bool, str]:
         return False, f"Unknown tool '{name}'"
     if not isinstance(arguments, dict):
         return False, "arguments must be an object"
+
+    # Backward compatibility for an already-warm speaking prompt and for the
+    # exact senior-mode failure seen in the field. The updated schema asks for
+    # an object, but an old model turn may still send either stringified JSON or
+    # the raw reminder sentence. Convert unambiguously here, then let the care
+    # handler ask for a missing schedule instead of failing on Unicode text.
+    if name == "update_care_plan" and isinstance(arguments.get("data"), str):
+        raw_data = arguments["data"].strip()
+        try:
+            parsed_data = json.loads(raw_data)
+        except json.JSONDecodeError:
+            parsed_data = None
+        if isinstance(parsed_data, dict):
+            arguments["data"] = parsed_data
+        elif (str(arguments.get("section", "")).strip().lower()
+              in ("reminder", "reminders")
+              and str(arguments.get("action", "")).strip().lower()
+              in ("add", "create") and raw_data):
+            arguments["data"] = {"message": raw_data}
+
     schema = fn.get("parameters", {}) or {}
     props = schema.get("properties", {}) or {}
     missing = [key for key in schema.get("required", []) if key not in arguments]
