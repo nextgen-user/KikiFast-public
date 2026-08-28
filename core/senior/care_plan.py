@@ -6,9 +6,10 @@ reminders (medicine / hydration / meal / appointment / exercise), guided
 exercise routines, family-approved music/topics, and a rolling ``care_log`` of
 what actually happened during the day (used for the daily caregiver summary).
 
-Voice-first: Kiki creates and edits this file from the caregiver's/senior's
-spoken instructions through the ``update_care_plan`` tool, but it is also plain
-JSON that a caregiver can hand-edit or a Web-UI can render.
+Voice-first: Kiki sends caregiver/senior requests to the complex care agent,
+which owns ``get_care_plan``/``update_care_plan`` and verifies scheduling. The
+store remains plain JSON that a caregiver Web UI can render and edit through a
+future API.
 
 Saves are atomic (tmp + ``os.replace``) so a crash mid-write never corrupts it.
 """
@@ -37,6 +38,14 @@ VALID_REMINDER_CATEGORIES = {
 #   {"kind": "daily",     "value": "HH:MM"}         -> fires each day at HH:MM
 #   {"kind": "once",      "value": "<ISO datetime>"}-> fires once at that time
 VALID_SCHEDULE_KINDS = {"recurring", "daily", "once"}
+VALID_ROUTINE_CATEGORIES = {
+    "morning", "medicine", "hydration", "meal", "exercise", "sleep",
+    "appointment", "wellbeing", "memory", "social", "safety", "other",
+}
+VALID_ROUTINE_ACTION_TYPES = {
+    "speak", "check_in", "guided_step", "memory_activity", "play_music",
+    "observe", "log", "notify_caregiver",
+}
 
 
 def _default_care_plan_path() -> Path:
@@ -53,6 +62,9 @@ DEFAULT_STRUCTURE: Dict[str, Any] = {
     "family_contacts": [],      # {name, relationship, email, notify_on:[alert,daily_summary]}
     "reminders": [],            # {id, category, message, schedule, enabled}
     "exercises": [],            # {id, name, steps:[...], schedule, prescribed_by, enabled}
+    # A person's day: each scheduled event is a sequence Kiki carries out.
+    "routine_events": [],       # {id,title,category,schedule,actions,continuous_vision,...}
+    "active_session": None,     # persisted multi-turn routine currently being conducted
     "approved_music": [],       # ["song / query", ...]
     "approved_topics": [],      # ["cricket", "old bollywood", ...]
     "care_log": [],             # {ts, kind, text}
@@ -123,6 +135,9 @@ class CarePlan:
             for ex in self.data.get("exercises", []):
                 if ex.get("enabled", True) and _valid_schedule(ex.get("schedule")):
                     items.append({**ex, "_kind": "exercise"})
+            for event in self.data.get("routine_events", []):
+                if event.get("enabled", True) and _valid_schedule(event.get("schedule")):
+                    items.append({**event, "_kind": "routine_event"})
             return items
 
     def contacts_for(self, purpose: str) -> List[Dict[str, Any]]:
@@ -137,6 +152,25 @@ class CarePlan:
     def language(self) -> str:
         with self._lock:
             return str(self.data.get("senior", {}).get("language") or "hi")
+
+    def daily_routine(self) -> List[Dict[str, Any]]:
+        """Enabled routine events in the order Kiki will encounter each day."""
+        with self._lock:
+            events = [json.loads(json.dumps(event))
+                      for event in self.data.get("routine_events", [])
+                      if event.get("enabled", True)]
+
+        def sort_key(event):
+            schedule = event.get("schedule") or {}
+            kind = schedule.get("kind")
+            value = str(schedule.get("value", ""))
+            if kind == "daily":
+                return (0, value, event.get("title", ""))
+            if kind == "once":
+                return (1, value, event.get("title", ""))
+            return (2, value, event.get("title", ""))
+
+        return sorted(events, key=sort_key)
 
     # -------------------------------------------------------------- mutators
     def set_senior_profile(self, **fields) -> bool:
@@ -231,6 +265,276 @@ class CarePlan:
 
     def remove_exercise(self, exercise_id: str) -> bool:
         return self._remove_item("exercises", exercise_id)
+
+    def add_routine_event(self, title: str, category: str,
+                          schedule: Dict[str, Any], actions: List[Dict[str, Any]],
+                          enabled: bool = True, source: str = "user",
+                          evidence: str = "", adaptation: Optional[Dict[str, Any]] = None,
+                          continuous_vision: bool = False, objective: str = ""
+                          ) -> Dict[str, Any]:
+        title = str(title or "").strip()
+        if not title:
+            raise ValueError("routine event title is required")
+        category = str(category or "other").strip().lower()
+        if category not in VALID_ROUTINE_CATEGORIES:
+            category = "other"
+        schedule = _normalize_schedule(schedule)
+        if not _valid_schedule(schedule):
+            raise ValueError(
+                "a valid routine schedule is required: daily HH:MM, recurring "
+                "positive seconds, or once ISO datetime")
+        actions = _normalize_routine_actions(actions)
+        if not actions:
+            raise ValueError("a routine event requires at least one valid action")
+        source = str(source or "user").strip().lower()
+        evidence = str(evidence or "").strip()
+        if not isinstance(continuous_vision, bool):
+            raise ValueError("continuous_vision must be true or false")
+        if source == "idle_mind" and len(evidence) < 20:
+            raise ValueError(
+                "idle-mind routine changes require concrete repeated-routine evidence")
+        adaptation = adaptation if isinstance(adaptation, dict) else {}
+        try:
+            review_after = max(
+                1, int(adaptation.get("review_after_occurrences", 3) or 3))
+        except (TypeError, ValueError):
+            review_after = 3
+        # Agent retries and network timeouts must be idempotent. If the exact
+        # event is already present, return it rather than creating a duplicate.
+        with self._lock:
+            duplicate = next((existing for existing in self.data.get("routine_events", [])
+                              if existing.get("enabled", True)
+                              and str(existing.get("title", "")).casefold() == title.casefold()
+                              and existing.get("category") == category
+                              and existing.get("schedule") == schedule), None)
+            if duplicate is not None:
+                result = json.loads(json.dumps(duplicate))
+                result["_existing"] = True
+                return result
+        now = datetime.now().isoformat()
+        item = {
+            "id": uuid.uuid4().hex[:8],
+            "title": title,
+            "objective": str(objective or title).strip(),
+            "category": category,
+            "schedule": schedule,
+            "actions": actions,
+            # While this interactive session is active, main.py captures a
+            # fresh frame after every turn through the existing Gemini vision
+            # pipeline and injects its description before the next turn.
+            "continuous_vision": bool(continuous_vision),
+            "enabled": bool(enabled),
+            "source": source,
+            "evidence": evidence,
+            "adaptation": {
+                "allowed": bool(adaptation.get("allowed", True)),
+                "strategy": str(adaptation.get("strategy", "adapt_to_response")).strip(),
+                "review_after_occurrences": review_after,
+            },
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._lock:
+            self.data.setdefault("routine_events", []).append(item)
+        if not self.save():
+            with self._lock:
+                self.data["routine_events"] = [
+                    existing for existing in self.data.get("routine_events", [])
+                    if existing.get("id") != item["id"]
+                ]
+            raise IOError("could not persist routine event")
+        return item
+
+    def edit_routine_event(self, event_id: str, **fields) -> bool:
+        fields = dict(fields)
+        if "title" in fields and not str(fields["title"] or "").strip():
+            raise ValueError("routine event title cannot be empty")
+        if "objective" in fields:
+            fields["objective"] = str(fields["objective"] or "").strip()
+        if "schedule" in fields:
+            fields["schedule"] = _normalize_schedule(fields["schedule"])
+            if not _valid_schedule(fields["schedule"]):
+                raise ValueError("routine event schedule is invalid")
+        if "actions" in fields:
+            fields["actions"] = _normalize_routine_actions(fields["actions"])
+            if not fields["actions"]:
+                raise ValueError("routine event requires at least one valid action")
+        if "continuous_vision" in fields:
+            if not isinstance(fields["continuous_vision"], bool):
+                raise ValueError("continuous_vision must be true or false")
+        fields["updated_at"] = datetime.now().isoformat()
+        return self._edit_item("routine_events", event_id, fields)
+
+    def remove_routine_event(self, event_id: str) -> bool:
+        with self._lock:
+            active = self.data.get("active_session") or {}
+            if active.get("event_id") == event_id and active.get("status") == "active":
+                self.data["active_session"] = None
+        return self._remove_item("routine_events", event_id)
+
+    def start_care_session(self, event_id: str) -> Dict[str, Any]:
+        with self._lock:
+            event = next((item for item in self.data.get("routine_events", [])
+                          if item.get("id") == event_id), None)
+            if event is None:
+                raise ValueError("no routine event with that id")
+            active = self.data.get("active_session")
+            if isinstance(active, dict) and active.get("status") == "active":
+                if active.get("event_id") == event_id:
+                    # A worker retry must resume, never restart, the same session.
+                    return self.care_session_state()
+                raise ValueError(
+                    "another care session is already active; finish or cancel it first")
+            session = {
+                "id": uuid.uuid4().hex[:8],
+                "event_id": event_id,
+                "event_title": event.get("title", ""),
+                "status": "active",
+                "action_index": 0,
+                "started_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "responses": [],
+                # This is a session-local outline. The voice AI may adapt,
+                # repeat, skip, or replace its remaining steps without silently
+                # changing the recurring caregiver-approved routine.
+                "session_actions": json.loads(json.dumps(event.get("actions", []))),
+                "adaptations": [],
+                "vision_override": None,
+            }
+            self.data["active_session"] = session
+        if not self.save():
+            raise IOError("could not persist active care session")
+        return self.care_session_state()
+
+    def advance_care_session(self, response: str = "") -> Dict[str, Any]:
+        with self._lock:
+            session = self.data.get("active_session")
+            if not isinstance(session, dict) or session.get("status") != "active":
+                raise ValueError("there is no active care session")
+            event = next((item for item in self.data.get("routine_events", [])
+                          if item.get("id") == session.get("event_id")), None)
+            if event is None:
+                raise ValueError("the active session's routine event no longer exists")
+            actions = session.get("session_actions") or event.get("actions", [])
+            current_index = int(session.get("action_index", 0))
+            presented = _routine_turn_actions(actions, current_index)
+            if str(response or "").strip():
+                session.setdefault("responses", []).append({
+                    "at": datetime.now().isoformat(),
+                    "action_index": current_index,
+                    "response": str(response).strip()[:500],
+                })
+            # One care turn may contain an introduction plus the first actual
+            # check-in. Advance past everything Kiki just presented, not merely
+            # one array element, so replies are attached to the right step.
+            session["action_index"] = current_index + len(presented)
+            session["updated_at"] = datetime.now().isoformat()
+            if session["action_index"] >= len(actions):
+                session["status"] = "completed"
+                session["completed_at"] = datetime.now().isoformat()
+            else:
+                next_actions = _routine_turn_actions(
+                    actions, session["action_index"])
+                # No reply is needed after a trailing close/log/notification
+                # batch. Return it once as completion_actions and finish the
+                # session; the care agent still performs those actions.
+                if next_actions and not any(
+                        action.get("needs_response") for action in next_actions):
+                    session["completion_actions"] = next_actions
+                    session["action_index"] = len(actions)
+                    session["status"] = "completed"
+                    session["completed_at"] = datetime.now().isoformat()
+        if not self.save():
+            raise IOError("could not persist care-session progress")
+        return self.care_session_state()
+
+    def adapt_care_session(self, response: str, remaining_actions: List[Dict[str, Any]],
+                           reason: str = "") -> Dict[str, Any]:
+        """Replace the current-and-remaining outline for this session only."""
+        replacement = _normalize_routine_actions(remaining_actions)
+        if not replacement:
+            raise ValueError("adaptive session change requires remaining_actions")
+        with self._lock:
+            session = self.data.get("active_session")
+            if not isinstance(session, dict) or session.get("status") != "active":
+                raise ValueError("there is no active care session")
+            event = next((item for item in self.data.get("routine_events", [])
+                          if item.get("id") == session.get("event_id")), None)
+            if event is None:
+                raise ValueError("the active session's routine event no longer exists")
+            actions = session.get("session_actions") or event.get("actions", [])
+            idx = max(0, int(session.get("action_index", 0)))
+            session["session_actions"] = (
+                json.loads(json.dumps(actions[:idx])) + replacement)
+            session.setdefault("adaptations", []).append({
+                "at": datetime.now().isoformat(),
+                "action_index": idx,
+                "response": str(response or "").strip()[:500],
+                "reason": str(reason or "").strip()[:500],
+            })
+            session["updated_at"] = datetime.now().isoformat()
+        if not self.save():
+            raise IOError("could not persist care-session adaptation")
+        return self.care_session_state()
+
+    def set_care_session_vision(self, enabled: bool) -> Dict[str, Any]:
+        """Override every-turn vision for this live session only."""
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be true or false")
+        with self._lock:
+            session = self.data.get("active_session")
+            if not isinstance(session, dict) or session.get("status") != "active":
+                raise ValueError("there is no active care session")
+            session["vision_override"] = enabled
+            session["updated_at"] = datetime.now().isoformat()
+        if not self.save():
+            raise IOError("could not persist care-session vision setting")
+        return self.care_session_state()
+
+    def finish_care_session(self, status: str = "completed", response: str = "") -> Dict[str, Any]:
+        status = str(status or "completed").strip().lower()
+        if status not in {"completed", "cancelled", "declined"}:
+            raise ValueError("session status must be completed, cancelled, or declined")
+        with self._lock:
+            session = self.data.get("active_session")
+            if not isinstance(session, dict):
+                raise ValueError("there is no care session to finish")
+            if str(response or "").strip():
+                session.setdefault("responses", []).append({
+                    "at": datetime.now().isoformat(),
+                    "action_index": session.get("action_index", 0),
+                    "response": str(response).strip()[:500],
+                })
+            session["status"] = status
+            session["updated_at"] = datetime.now().isoformat()
+            session["completed_at"] = datetime.now().isoformat()
+        if not self.save():
+            raise IOError("could not persist care-session completion")
+        return self.care_session_state()
+
+    def care_session_state(self) -> Dict[str, Any]:
+        with self._lock:
+            session = json.loads(json.dumps(self.data.get("active_session")))
+            if not isinstance(session, dict):
+                return {"status": "none"}
+            event = next((item for item in self.data.get("routine_events", [])
+                          if item.get("id") == session.get("event_id")), None)
+            if event:
+                actions = session.get("session_actions") or event.get("actions", [])
+                idx = int(session.get("action_index", 0))
+                session["total_actions"] = len(actions)
+                turn_actions = (
+                    _routine_turn_actions(actions, idx)
+                    if session.get("status") == "active" else [])
+                session["turn_actions"] = turn_actions
+                session["current_action"] = turn_actions[-1] if turn_actions else None
+                session["awaiting_response"] = any(
+                    action.get("needs_response") for action in turn_actions)
+                override = session.get("vision_override")
+                session["continuous_vision"] = (
+                    override if isinstance(override, bool)
+                    else bool(event.get("continuous_vision", False)))
+            return session
 
     def add_family_contact(self, name: str, email: str, relationship: str = "",
                            notify_on: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -372,6 +676,46 @@ def _normalize_schedule(schedule: Any) -> Dict[str, Any]:
     else:
         return {}
     return {"kind": kind, "value": value}
+
+
+def _normalize_routine_actions(actions: Any) -> List[Dict[str, Any]]:
+    if not isinstance(actions, list):
+        return []
+    normalized = []
+    for raw in actions[:20]:
+        if not isinstance(raw, dict):
+            continue
+        action_type = str(raw.get("type", "speak")).strip().lower()
+        if action_type not in VALID_ROUTINE_ACTION_TYPES:
+            continue
+        instruction = str(
+            raw.get("instruction") or raw.get("text") or raw.get("question") or ""
+        ).strip()
+        steps = [str(step).strip() for step in (raw.get("steps") or [])
+                 if str(step).strip()]
+        if action_type == "guided_step" and not instruction and steps:
+            instruction = steps[0]
+        if not instruction:
+            continue
+        normalized.append({
+            "type": action_type,
+            "instruction": instruction,
+            "needs_response": bool(raw.get(
+                "needs_response", action_type in {"check_in", "guided_step"})),
+            "success_signal": str(raw.get("success_signal", "")).strip(),
+            "on_concern": str(raw.get("on_concern", "")).strip(),
+        })
+    return normalized
+
+
+def _routine_turn_actions(actions: List[Dict[str, Any]], start: int) -> List[Dict[str, Any]]:
+    """Return the ordered actions Kiki should conduct before waiting again."""
+    batch: List[Dict[str, Any]] = []
+    for action in actions[max(0, int(start)):]:
+        batch.append(json.loads(json.dumps(action)))
+        if action.get("needs_response"):
+            break
+    return batch
 
 
 # ============================================================================

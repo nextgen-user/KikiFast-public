@@ -1,10 +1,10 @@
 """SeniorCareManager — bridges the care plan onto the existing workers scheduler.
 
-When the ``senior`` assistant mode is entered, every enabled reminder / guided
-exercise in ``care_plan.json`` is materialized into a real background *worker*
-(§5.13) plus a daily caregiver-summary worker. Leaving the mode cancels them.
-Editing the care plan by voice re-syncs (cancel + rebuild) so changes take
-effect immediately.
+When the ``senior`` assistant mode is entered, every enabled routine event,
+legacy reminder, and guided exercise in ``care_plan.json`` is materialized into
+a real background *worker* (§5.13), plus a daily caregiver-summary worker.
+Leaving the mode cancels them. Schedule edits re-sync immediately; progress
+inside an active multi-turn session deliberately does not rebuild its worker.
 
 Nothing here re-implements scheduling or speaking — it drives
 ``WorkerManager.create_worker`` and lets the normal worker path speak the
@@ -18,6 +18,7 @@ Schedule mapping:
   once      {value=ISO}    -> one-shot scheduled_time worker
 """
 
+import json
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -78,6 +79,60 @@ class SeniorCareManager:
                 and worker.is_active()
                 for worker in self.wm.list_workers(include_completed=True)
             )
+        except Exception:
+            return False
+
+    def schedule_receipt(self, item_id: str = "") -> dict:
+        """Verified runtime receipt for one or all materialized care workers."""
+        suffix = f":{item_id}" if item_id else ""
+        receipts = []
+        now = datetime.now()
+        try:
+            workers = self.wm.list_workers(include_completed=True)
+        except Exception as exc:
+            return {"status": "error", "scheduled": False, "reason": str(exc)}
+        for worker in workers:
+            if not worker.name.startswith(_WORKER_PREFIX):
+                continue
+            if suffix and not worker.name.endswith(suffix):
+                continue
+            if not worker.is_active():
+                continue
+            trigger = worker.trigger
+            next_at = None
+            if trigger.trigger_type == TriggerType.SCHEDULED_TIME.value:
+                next_at = trigger.scheduled_time
+            elif (trigger.trigger_type == TriggerType.RECURRING.value
+                  and trigger.interval_seconds):
+                try:
+                    last = datetime.fromisoformat(trigger.last_fired_at)
+                    target = last + timedelta(seconds=int(trigger.interval_seconds))
+                    while target <= now:
+                        target += timedelta(seconds=int(trigger.interval_seconds))
+                    next_at = target.isoformat()
+                except (TypeError, ValueError):
+                    next_at = None
+            receipts.append({
+                "worker_id": worker.id,
+                "worker_name": worker.name,
+                "status": worker.status,
+                "trigger_type": trigger.trigger_type,
+                "next_trigger_at": next_at,
+            })
+        return {
+            "status": "scheduled" if receipts else "not_scheduled",
+            "scheduled": bool(receipts),
+            "item_id": item_id,
+            "timezone": "Asia/Kolkata",
+            "workers": receipts,
+        }
+
+    def continuous_vision_required(self) -> bool:
+        """Whether the currently active guided session requests every-turn vision."""
+        try:
+            session = self.plan.care_session_state()
+            return (session.get("status") == "active"
+                    and bool(session.get("continuous_vision", False)))
         except Exception:
             return False
 
@@ -154,6 +209,32 @@ class SeniorCareManager:
         lang = self.plan.language()
         lang_note = ("Speak in natural, clear Hindi (Devanagari)."
                      if lang == "hi" else "Speak in simple, clear English.")
+        if item.get("_kind") == "routine_event":
+            actions = item.get("actions", [])
+            interactive = any(action.get("needs_response") for action in actions)
+            action_json = json.dumps(actions, ensure_ascii=False)
+            session_rule = (
+                f"First call update_care_plan(section='care_session', action='start', "
+                f"data={{'event_id':'{item.get('id', '')}'}}). Read the returned turn_actions, "
+                "conduct ALL of them in order, then stop at the response-required action so "
+                "the person can answer. The foreground "
+                "care agent will continue the persisted session on their next turn."
+                if interactive else
+                "Carry out the actions in order now. Use tools for tool actions, combine the "
+                "spoken actions into one warm concise interaction, and add a care_log entry."
+            )
+            return (
+                f"A daily care-routine event is due: '{item.get('title', '')}' "
+                f"(event id {item.get('id', '')}, category {item.get('category', 'other')}). "
+                f"{lang_note} This is an ordered care sequence, not a generic reminder. "
+                f"Actions JSON: {action_json}. Continuous per-turn vision feedback is "
+                f"{'enabled' if item.get('continuous_vision') else 'disabled'} for this event. "
+                f"{session_rule} The actions are an adaptable goal outline, not fixed dialogue: "
+                "the voice AI must phrase them naturally and accept skip/repeat/slower/change/stop "
+                "requests. Adapt warmly to the person's response and never claim an action was "
+                "completed if it was not. Respond ONLY "
+                "with final JSON status, speak=true, and the exact speak_text to say now."
+            )
         if item.get("_kind") == "exercise":
             steps = " | ".join(item.get("steps", []))
             return (

@@ -897,6 +897,7 @@ async def main():
 
     # --- Senior Citizen Mode: bridge the care plan onto the workers scheduler ---
     # Additive: only does anything while the 'senior' assistant mode is active.
+    senior_care_mgr = None
     try:
         from core.senior.care_plan import get_care_plan_store
         from core.senior.senior_care_manager import get_senior_care_manager
@@ -1259,6 +1260,45 @@ async def main():
         face_history,
         gesture_event_handler=handle_hand_gesture,
     ))
+
+    # --- Senior Care: CLIP activity events (gates 04-05) ---
+    # Additive and fail-open, like the care-plan bridge above: the Hailo process
+    # publishes care_activity only for candidates that already survived
+    # threshold/margin/persistence/dwell, and this consumer re-checks each one
+    # against the live frame before it is allowed to reach the history.
+    care_events_consumer = None
+    try:
+        from core.senior.health_events import HealthEventConsumer
+        from core.senior.care_plan import get_care_plan_store as _get_care_plan
+        from core.llm import hot_inject as _hot_inject
+        _care_cfg = full_config.get("senior_mode", {}).get("health_events", {})
+
+        def _care_inject(text):
+            _hot_inject(message_history, {"role": "system", "content": text})
+
+        def _care_speak(activity, record):
+            # The speaking budget has already been checked. Injecting a direct
+            # instruction reuses the proven face-event path rather than opening
+            # a second route into the speaking loop.
+            _hot_inject(message_history, {
+                "role": "system",
+                "content": (f"[Care: {activity} confirmed — "
+                            f"{record.get('description', '')[:160]}. "
+                            f"Check in with them about this, briefly and warmly.]"),
+            })
+
+        care_events_consumer = HealthEventConsumer(
+            config=_care_cfg,
+            care_plan=_get_care_plan(),
+            speak=_care_speak,
+            inject=_care_inject,
+            host=_care_cfg.get("event_host", "127.0.0.1"),
+            port=int(_care_cfg.get("event_port", 5556)),
+        )
+        if care_events_consumer.start():
+            print("[Care] activity events wired to the conversation")
+    except Exception as _care_err:
+        print(f"[Care] health events skipped: {_care_err}")
 
     # --- Vision Logic ---
     vision_task_ref = None
@@ -2465,7 +2505,14 @@ async def main():
                 # We trigger background vision update if:
                 # - vision_every_message is True (every turn capture)
                 # - main_vision_enabled is True and it's time for vision injection (every N turns)
-                should_trigger_vision = vision_every_message or (main_vision_enabled and turn_counter % main_vision_every_n == 0)
+                care_vision_every_turn = bool(
+                    senior_care_mgr is not None
+                    and senior_care_mgr.continuous_vision_required())
+                should_trigger_vision = (
+                    vision_every_message
+                    or care_vision_every_turn
+                    or (main_vision_enabled
+                        and turn_counter % main_vision_every_n == 0))
                 if should_trigger_vision:
                     if not vision_task_ref or vision_task_ref.done():
                         vision_task_ref = asyncio.create_task(

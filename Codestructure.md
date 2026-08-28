@@ -1696,6 +1696,74 @@ capping is the only lever that reduces *actual* draw without giving up a
 peripheral — `usb_max_current_enable` only caps what the Pi will supply, and
 with a single webcam on USB there is little there to reclaim.
 
+### 5.18i CLIP care-event cascade — senior activity detection
+
+Zero false positives is a property of the pipeline, not of CLIP. CLIP only
+*nominates*; five gates in sequence decide, each cheaper than the next, so the
+expensive judgement runs on a few candidates an hour rather than 30 frames a
+second.
+
+| Gate | Where | Rejects |
+|---|---|---|
+| 01 prompt geometry | `~/Kiki/navigation/health_texts.json` → `clip_prompts.json` | semantic neighbours (phone-to-ear scoring as drinking) |
+| 02 margin + persistence | `care_gate.py` | single-frame spikes, motion blur, flicker |
+| 03 plausibility | `care_gate.py` | too-brief runs, repeats inside the refractory |
+| 04 VLM adjudication | `core/senior/health_events.py` | the confident-but-wrong CLIP match |
+| 05 care relevance | `core/senior/health_events.py` | true but pointless interruptions |
+
+**Write prompts for pixels, not meaning.** CLIP cannot see *water* — only a
+vessel travelling to a mouth. `"person raising a cup or bottle to their mouth"`
+works where `"person drinking water"` cannot; naming the drink is gate 04's job.
+Six positives sit against **eleven negative distractors**, and the negatives do
+most of the work: the matcher discards any crop whose best match is one of them.
+
+Scores are a **softmax over all 17 prompts at temperature 100**, so a similarity
+is a probability summing to 1 across the set (uniform = 0.059, a clear winner
+lands 0.5+). That is why thresholds look low next to a raw cosine. The callback
+recomputes the distribution itself rather than using `matcher.match()`, which
+returns only the single best entry per person even with `report_all=True` — the
+margin test and the debug panel both need the runner-up and the losing
+negatives.
+
+**Tuning workflow, no calibration pass.** `~/Kiki/navigation/care_events.json`
+is **hot-reloaded** on mtime, so thresholds change while the service runs. The
+MJPEG stream at `:5000` carries a debug panel showing, per track: the winning
+event, an evidence bar (`[####------] 4/5`), dwell, margin, the current blocking
+reason, and **the raw top-3 including negatives**. That last line is the
+diagnosis — a negative sitting just under the positive means the prompt set
+needs a distractor, not a lower threshold. Colour: green fired, amber building,
+red blocked by a distractor (which it names).
+
+Rebuild embeddings after editing prompts:
+
+```bash
+~/Kiki/navigation/scripts/build_clip_prompts.sh    # RN50x4, 640-d, offline
+```
+
+The variant is load-bearing: the HEF emits 640-d image embeddings and the
+callback refuses to match a prompt file of any other width. `RN50x4.pt` is
+cached in `~/.cache/clip`, so generation needs no network; runtime matching is
+pure numpy and never imports torch.
+
+Gate 04 never asks a leading question — "is she drinking?" invites a yes. It
+asks what the person is doing, open-ended, then tests whether that free answer
+*entails* the activity. `UNCLEAR` is first-class and counts as a rejection, two
+frames a few seconds apart must independently agree, and any vision failure
+(offline, rate-limited) **fails closed**. A confirmed event is *logged*, not
+spoken: `senior_mode.health_events.speak_for` is the short allow-list of
+activities permitted to interrupt, under a per-window budget.
+
+Enabling this took `hailo_follower.service` from `--vision-mode none` to
+`clip` — 2 models to 4. Measured cost: rails peak 6.3 W (from ~4.2 W), SoC
+70 °C (from 58 °C), EXT5V steady at 5.08–5.22 V with no cut. It fits inside the
+headroom the CPU cap (§5.18h) bought, but it is not free — see §5.18g if the
+board starts dropping again.
+
+**Dropped from v1 deliberately:** `fall` and `chest_discomfort`. Both needed
+pose or a vitals signal; a CLIP-only fall detector that misfires trains the user
+to ignore it, which is worse than not having one. `coughing` is audio-shaped,
+not visual, and belongs on the always-listen path.
+
 ### 5.19 `tests/streaming_tts.py` (≈500 lines)
 
 Self-contained gapless streaming-TTS library (mirrors `core/tts.py` LocalTTSStreamer
@@ -1753,20 +1821,33 @@ existing speaking path, workers scheduler, face recognition, memory search, Unif
 listening — it adds a caregiver **care plan** and family **email** on top.
 
 - **`care_plan.py`** — `CarePlan` over `care_plan.json` (gitignored; path from `senior_mode.care_plan_file`).
-  Atomic tmp+`os.replace` saves, module singleton (`get_care_plan_store`). Sections: `senior` (profile+
-  language), `family_contacts` ({name,email,relationship,notify_on:[alert,daily_summary]}), `reminders`
-  ({id,category,message,schedule,enabled}), `exercises` ({id,name,steps,schedule,prescribed_by}),
-  `approved_music`, `approved_topics`, `care_log` (rolling ≤500). Schedule shape:
+  Atomic tmp+`os.replace` saves, module singleton (`get_care_plan_store`). The canonical daily-plan unit is
+  `routine_events`: `{id,title,category,schedule,actions[],continuous_vision,source,evidence,adaptation}`.
+  Each event is an ordered goal/safety outline the voice AI conducts adaptively (`speak`, `check_in`, `guided_step`, `memory_activity`,
+  `play_music`, `observe`, `log`, `notify_caregiver`), not fixed dialogue or a reminder string. `active_session`
+  persists a session-local outline, current action batch, deviations, and replies across turns/restarts. The
+  agent can skip/repeat/replace remaining steps without changing future occurrences unless explicitly asked.
+  Legacy `reminders`/`exercises`, `senior`, contacts,
+  approved content and the rolling `care_log` (≤500) remain compatible. Schedule shape:
   `{"kind":"recurring","value":<sec>}` | `{"kind":"daily","value":"HH:MM"}` | `{"kind":"once","value":"<ISO>"}`.
 - **`senior_care_manager.py`** — `SeniorCareManager` bridges the care plan onto `WorkerManager`.
-  `activate()` materializes one worker per enabled reminder/exercise + a daily-summary worker;
+  `activate()` materializes one worker per enabled routine/reminder/exercise + a daily-summary worker;
   `deactivate()` cancels every `senior:*` worker; `sync_workers()` rebuilds after a voice edit.
   Daily schedules are recurring 86400s workers whose `last_fired_at` is back-dated so the first fire
   lands at HH:MM (§workers scheduler uses elapsed-since-last-fired). Reminder/exercise workers speak via
   the normal `execute_worker → _speak_text` path in Hindi; the daily-summary worker reads `care_log` and
-  calls `send_care_email`.
-- **Tools** (in `tools.py`, on senior mode's per-mode `main_tools`): `update_care_plan(section,action,data)`
-  and `get_care_plan(section)` (voice-first plan editing → auto `sync_workers`), `alert_family(reason,
+  calls `send_care_email`. `schedule_receipt()` proves the exact item has an active worker and reports its
+  next trigger in Asia/Kolkata. During an active event with `continuous_vision=true`, `main.py` forces the
+  existing Gemini capture/describe/inject pipeline after every conversational turn; completion/cancellation
+  turns this session-scoped override off automatically.
+- **Agent ownership**: senior foreground care requests route to `complex_query`; direct `get_care_plan` and
+  `update_care_plan` are intentionally absent from the speaking model's tool list. The care-specific complex
+  agent reads first, corrects machine-format failures, writes an idempotent routine event, and verifies its
+  runtime worker before promising success. Unified Idle Mind may call `complex_query` only for care-plan
+  formulation/adaptation, only with concrete repeated-routine evidence; it cannot write the plan directly.
+- **Tools** (in `tools.py`, private to the complex care agent): `update_care_plan(section,action,data)`,
+  `get_care_plan(section)`, and `get_care_schedule_status(item_id)`. Public emergency/email tools remain
+  `alert_family(reason,
   urgency)` (emails all alert contacts on distress/emergency + logs it), `send_care_email(to,subject,body)`
   (used by the daily-summary worker). Email goes through a **Gmail MCP**: `send_care_email` reads
   `senior_mode.email.{connection,tool,arg_map}` and calls `smithery_cli.tool_call` (same path as
@@ -1775,7 +1856,7 @@ listening — it adds a caregiver **care plan** and family **email** on top.
   field `recipient`, not `to`). Sending needs the `gmail.send` scope on the Arcade grant,
   which the read-only setup link does NOT include — see §5.15a.
 - **Per-mode `main_tools`**: `core/llm.py _effective_main_tools()` honors an optional
-  `assistant_modes.modes.<mode>.main_tools` override (senior adds the care/alert tools), else the global
+  `assistant_modes.modes.<mode>.main_tools` override (senior adds `complex_query` and emergency tools), else the global
   `llm.main_tools`. Cache-safe — a mode switch already replaces msg[0] and re-warms (§4).
 - **Wiring** (`main.py`): the manager singleton is built right after `worker_manager.start_scheduler()`
   (activates if `active_on_startup == "senior"`), and `sync_mode_prompt` (the cache-safe mode boundary)

@@ -1573,7 +1573,8 @@ def _normalize_spoken_care_schedule(value: Any) -> Any:
 async def update_care_plan(section: str, action: str, data: Any = None) -> str:
     """Create or edit the caregiver care plan (voice-first) and re-sync workers.
 
-    section: reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log
+    section: routine_event | care_session | reminder | exercise | family_contact |
+             approved_music | approved_topics | senior | care_log
     action:  add | edit | remove | set
     data:    JSON object with the fields for that section/action, e.g.
              reminder add -> {"category":"medicine","message":"Take BP pill","schedule":{"kind":"daily","value":"09:00"}}
@@ -1598,6 +1599,12 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
             "contacts": "family_contact",
             "profile": "senior",
             "care_logs": "care_log",
+            "routine": "routine_event",
+            "routines": "routine_event",
+            "routine_events": "routine_event",
+            "daily_routine": "routine_event",
+            "session": "care_session",
+            "active_session": "care_session",
         }.get(section, section)
         action = {
             "create": "add",
@@ -1650,6 +1657,11 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
                     "enabled": d.get("enabled", True),
                 }
                 section = "reminder"
+        elif section == "routine_event":
+            if not d.get("schedule") and d.get("time"):
+                d["schedule"] = d["time"]
+            if "schedule" in d:
+                d["schedule"] = _normalize_spoken_care_schedule(d["schedule"])
 
         allowed_actions = {
             "reminder": {"add", "edit", "remove"},
@@ -1659,11 +1671,13 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
             "approved_topics": {"add", "remove"},
             "senior": {"set", "edit"},
             "care_log": {"add"},
+            "routine_event": {"add", "edit", "remove"},
+            "care_session": {"start", "advance", "adapt", "set_vision", "complete", "cancel", "decline"},
         }
         if section not in allowed_actions:
             return (f"ERROR: No change was saved. Unknown section '{section}'. Use "
                     "reminder, exercise, family_contact, approved_music, "
-                    "approved_topics, senior, or care_log.")
+                    "approved_topics, senior, care_log, routine_event, or care_session.")
         if action not in allowed_actions[section]:
             return (f"ERROR: No change was saved. Action '{action}' is not valid "
                     f"for section '{section}'.")
@@ -1676,9 +1690,17 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
                 return ("NEEDS_CLARIFICATION: No reminder was saved. Ask what time "
                         "it should run. For a daily reminder, save schedule as "
                         "{'kind':'daily','value':'HH:MM'} after the user answers.")
+        if section == "routine_event" and action == "add":
+            missing = [key for key in ("title", "schedule", "actions") if not d.get(key)]
+            if missing:
+                return ("NEEDS_CLARIFICATION: No routine event was saved. Missing: "
+                        + ", ".join(missing) + ".")
         ok = True
         msg = ""
         scheduled_item_id = ""
+        # A stable machine-readable result lets the orchestrating agent verify
+        # the exact worker without scraping translated/human-facing prose.
+        receipt_metadata: Dict[str, str] = {}
 
         if section == "reminder":
             if action == "add":
@@ -1705,6 +1727,59 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
             elif action == "remove":
                 ok = plan.remove_exercise(d.get("id", ""))
                 msg = "Exercise removed." if ok else "No exercise with that id."
+        elif section == "routine_event":
+            if action == "add":
+                item = plan.add_routine_event(
+                    title=d.get("title", ""),
+                    category=d.get("category", "other"),
+                    schedule=d.get("schedule", {}),
+                    actions=d.get("actions", []),
+                    enabled=d.get("enabled", True),
+                    source=d.get("source", "user"),
+                    evidence=d.get("evidence", ""),
+                    adaptation=d.get("adaptation"),
+                    continuous_vision=d.get("continuous_vision", False),
+                    objective=d.get("objective", ""),
+                )
+                scheduled_item_id = item["id"]
+                receipt_metadata = {
+                    "section": "routine_event",
+                    "item_id": scheduled_item_id,
+                }
+                msg = (("Routine event already existed" if item.get("_existing")
+                        else "Added routine event")
+                       + f" '{item['title']}' (id {item['id']}).")
+            elif action == "edit":
+                event_id = d.get("id", "")
+                ok = plan.edit_routine_event(
+                    event_id, **{k: v for k, v in d.items() if k != "id"})
+                scheduled_item_id = event_id if ok else ""
+                if scheduled_item_id:
+                    receipt_metadata = {
+                        "section": "routine_event",
+                        "item_id": scheduled_item_id,
+                    }
+                msg = (f"Routine event updated (id {event_id})." if ok
+                       else "No routine event with that id.")
+            elif action == "remove":
+                ok = plan.remove_routine_event(d.get("id", ""))
+                msg = "Routine event removed." if ok else "No routine event with that id."
+        elif section == "care_session":
+            if action == "start":
+                state = plan.start_care_session(d.get("event_id", ""))
+            elif action == "advance":
+                state = plan.advance_care_session(d.get("response", ""))
+            elif action == "adapt":
+                state = plan.adapt_care_session(
+                    d.get("response", ""), d.get("remaining_actions", []),
+                    d.get("reason", ""))
+            elif action == "set_vision":
+                state = plan.set_care_session_vision(d.get("enabled"))
+            elif action in {"complete", "cancel", "decline"}:
+                status = {"cancel": "cancelled", "decline": "declined"}.get(
+                    action, "completed")
+                state = plan.finish_care_session(status, d.get("response", ""))
+            msg = "Care session state: " + json.dumps(state, ensure_ascii=False)
         elif section == "family_contact":
             if action == "add":
                 c = plan.add_family_contact(d.get("name", ""), d.get("email", ""),
@@ -1729,7 +1804,8 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
         sync_problem = ""
         try:
             mgr = get_senior_care_manager()
-            if mgr is not None and mgr.is_active():
+            schedule_changed = section in {"reminder", "exercise", "routine_event"}
+            if schedule_changed and mgr is not None and mgr.is_active():
                 mgr.sync_workers()
                 if (scheduled_item_id and hasattr(mgr, "is_item_scheduled")
                         and not mgr.is_item_scheduled(scheduled_item_id)):
@@ -1745,7 +1821,12 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
             return f"ERROR: No change was saved. {msg or 'No change made.'}"
         if sync_problem:
             return f"PARTIAL: {sync_problem} Do not promise that it will trigger."
-        return f"SUCCESS: {msg or 'Care plan updated.'}"
+        result = f"SUCCESS: {msg or 'Care plan updated.'}"
+        if receipt_metadata:
+            result += ("\nRECEIPT_JSON: "
+                       + json.dumps(receipt_metadata, ensure_ascii=False,
+                                    separators=(",", ":")))
+        return result
     except ValueError as e:
         return f"ERROR: No change was saved. {e}"
     except Exception as e:
@@ -1760,19 +1841,27 @@ async def get_care_plan(section: str = "") -> str:
         plan = get_care_plan_store()
         section = (section or "").strip().lower()
         alias = {"reminder": "reminders", "exercise": "exercises",
-                 "family_contact": "family_contacts"}
+                 "family_contact": "family_contacts", "routine": "routine_events",
+                 "routine_event": "routine_events", "routines": "routine_events",
+                 "day": "daily_routine", "daily_routine": "daily_routine",
+                 "care_session": "active_session", "session": "active_session"}
         if not section:
             overview = {
                 "senior": plan.get_section("senior"),
                 "reminders": plan.get_section("reminders"),
                 "exercises": plan.get_section("exercises"),
+                "routine_events": plan.get_section("routine_events"),
+                "daily_routine": plan.daily_routine(),
+                "active_session": plan.care_session_state(),
                 "family_contacts": plan.get_section("family_contacts"),
                 "approved_music": plan.get_section("approved_music"),
                 "approved_topics": plan.get_section("approved_topics"),
             }
             return json.dumps(overview, ensure_ascii=False, indent=2)
         key = alias.get(section, section)
-        value = plan.get_section(key)
+        value = (plan.care_session_state() if key == "active_session"
+                 else plan.daily_routine() if key == "daily_routine"
+                 else plan.get_section(key))
         if key == "care_log" and isinstance(value, list):
             value = value[-30:]  # only recent entries
         if value is None:
@@ -1780,6 +1869,26 @@ async def get_care_plan(section: str = "") -> str:
         return json.dumps(value, ensure_ascii=False, indent=2)
     except Exception as e:
         return f"Error reading care plan: {e}"
+
+
+async def get_care_schedule_status(item_id: str = "") -> str:
+    """Return a verified worker receipt with the exact next trigger time."""
+    try:
+        from core.senior.senior_care_manager import get_senior_care_manager
+        manager = get_senior_care_manager()
+        if manager is None:
+            return json.dumps({
+                "status": "inactive", "item_id": item_id,
+                "scheduled": False,
+                "reason": "senior care manager is not initialized",
+            })
+        receipt = manager.schedule_receipt(str(item_id or "").strip())
+        return json.dumps(receipt, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "status": "error", "item_id": item_id, "scheduled": False,
+            "reason": str(e),
+        }, ensure_ascii=False)
 
 
 async def send_care_email(to: str, subject: str, body: str) -> str:
@@ -2762,13 +2871,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "update_care_plan",
-            "description": "Senior mode: create or edit the care plan (reminders, exercises, family contacts, approved music/topics, senior profile) from spoken instructions. Changes take effect immediately.",
+            "description": "Care-agent only: create/edit the person's daily routine as scheduled multi-action routine_events, manage active care sessions, and maintain legacy reminders/exercises/contacts. Changes sync immediately.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "section": {"type": "string", "description": "reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"},
-                    "action": {"type": "string", "description": "add | edit | remove | set"},
-                    "data": {"type": "object", "description": "Fields for the chosen section. Reminder add requires message and schedule, e.g. {\"category\":\"medicine\",\"message\":\"BP pill\",\"schedule\":{\"kind\":\"daily\",\"value\":\"09:00\"}}. Preserve the user's original language. schedule.kind is daily(value HH:MM) | recurring(value positive seconds) | once(value ISO datetime)."}
+                    "section": {"type": "string", "description": "routine_event | care_session | reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"},
+                    "action": {"type": "string", "description": "routine_event: add/edit/remove; care_session: start/advance/adapt/set_vision/complete/cancel/decline; others: add/edit/remove/set"},
+                    "data": {"type": "object", "description": "routine_event add: {title,objective,category,schedule:{kind,value},actions:[{type,instruction,needs_response,success_signal,on_concern}],continuous_vision:boolean,source,evidence,adaptation}. Actions are adaptable goals, not fixed dialogue. care_session adapt: {response,reason,remaining_actions:[...]}; changes only the live session unless routine_event is explicitly edited. Set continuous_vision=true only for guided events needing a fresh Gemini camera description after every turn. Preserve original language."}
                 },
                 "required": ["section", "action"]
             }
@@ -2778,11 +2887,25 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_care_plan",
-            "description": "Senior mode: read the care plan to confirm reminders/exercises/contacts. Empty section returns an overview.",
+            "description": "Care agent: read the person's daily routine, active care session, reminders, exercises and contacts. Empty section returns an overview.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "section": {"type": "string", "description": "empty=overview | reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"}
+                    "section": {"type": "string", "description": "empty=overview | routine_event | care_session | reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_care_schedule_status",
+            "description": "Care agent: verify that a care-plan event has an active worker and return its exact next_trigger_at receipt. Must be called after every scheduled care-plan add/edit before claiming success.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "description": "Care-plan item id returned by update_care_plan; empty lists all active care workers"}
                 },
                 "required": []
             }
@@ -3034,6 +3157,7 @@ _ASYNC_TOOL_HANDLERS = {
     # Senior citizen mode
     "update_care_plan": update_care_plan,
     "get_care_plan": get_care_plan,
+    "get_care_schedule_status": get_care_schedule_status,
     "send_care_email": send_care_email,
     "alert_family": alert_family,
 }
