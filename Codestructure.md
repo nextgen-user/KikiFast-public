@@ -1117,9 +1117,14 @@ mangle Devanagari (नमस्ते → नमसत).
   from cross-session duplicate blocking because inbox/workspace contents may change;
   the shared agent loop still suppresses an exact duplicate inside one session.
 - Routine Gmail/Notion reads use those five compact tools directly. Raw
-  `self_extend_tool_call` requests for `fetch_emails`, Gmail message fetches,
-  `notion-search`, or `notion-fetch` are redirected by policy so full HTML, MIME
-  headers, MCP envelopes, and oversized workspace results cannot enter agent context.
+  `self_extend_tool_call` requests for `Gmail_ListEmails`, `Gmail_SearchEmailsByQuery`,
+  `Gmail_GetEmail`, `Gmail_GetThread`, `notion-search`, or `notion-fetch` are redirected
+  by policy so full HTML, MIME headers, MCP envelopes, and oversized workspace results
+  cannot enter agent context. The pre-2026-08 Gmail names (`fetch_emails`,
+  `fetch_message_by_message_id`, `fetch_message_by_thread_id`) stay in the redirect map
+  so a model working from a stale prompt is still caught. **Keys in
+  `_GENERIC_MCP_READ_REPLACEMENTS` must be lowercase** — the guard lowercases the
+  connection/tool pair before looking it up.
 - `_run_session` uses the shared `run_agent_loop`, records a complete observability
   session, consumes ambient snippets on success, and persists the next check.
 - Foreground activity calls `interrupt`, but this deliberately does not cancel cloud
@@ -1299,6 +1304,57 @@ Known people list comes from the Hailo train directory.
 - **`kiki_self_extend_agent.py` (449)** — autonomous JSON-loop agent (same
   thought/tool/done protocol) over `generate_llm_resp.generate`; goal-driven skill/MCP
   installation. Triggered via the `self_extend_run_task` tool or (when enabled) Unified Idle Mind.
+
+### 5.15a Gmail MCP: two auth layers and the 2026-08 server swap
+
+Smithery replaced the server behind the `gmail` slug with an **Arcade-backed** one. Same
+`connectionUrl` (`https://server.smithery.ai/gmail`), completely different surface: 30
+`Gmail_*` tools instead of `fetch_emails` / `fetch_message_by_message_id` /
+`fetch_message_by_thread_id`. An existing connection keeps talking to whatever version it
+was created against, so **the break lands when the connection is recreated**, not when the
+server changes — re-authenticating replaces the connection and silently swaps the tool set.
+
+**Authorization is two independent layers, and they report separately:**
+
+| layer | checked with | failure looks like |
+|---|---|---|
+| Smithery connection | `smithery mcp get gmail` | `status.state: auth_required` + `connect.smithery.ai/...` URL |
+| Arcade → Google grant | `smithery tool call gmail Gmail_WhoAmI '{}'` | returns an `accounts.google.com` OAuth URL instead of the profile |
+
+Layer 1 can read `connected` while layer 2 is still unauthorized — that mismatch is what
+makes this confusing to diagnose. **`Gmail_WhoAmI` is the real health check**: it returns
+`my_email_address` only when both layers are good.
+
+To (re)authorize both scopes at once, ask the server for a combined link rather than
+walking into consent twice:
+
+```
+smithery tool call gmail System_ManageAuthorization \
+  '{"action":"authorize","tools":["Gmail_ListEmails","Gmail_SearchEmailsByQuery",
+    "Gmail_GetEmail","Gmail_GetThread","Gmail_SendEmail","Gmail_WhoAmI"]}'
+```
+
+Naming `Gmail_SendEmail` is what pulls `gmail.send` into the grant; a read-only
+authorization leaves `send_care_email` broken. Re-run with `"action":"status"` to confirm.
+
+**Response shapes differ between the read tools** (`mcp_data_access._compact_email`
+normalises all of them):
+
+- `Gmail_ListEmails` / `Gmail_GetEmail` / `Gmail_GetThread` → `id`, `from_`
+- `Gmail_SearchEmailsByQuery` → `message_id`, `sender`
+- Bodies arrive pre-parsed as `body` (plain) and `html_body`. There is **no** base64 MIME
+  `payload` tree any more; the old `_part_text()` walker is gone.
+- Paging moved into a `pagination` object (`total_estimate`, `next_page_token`).
+- `Gmail_ListEmails` takes `n_emails`, `Gmail_SearchEmailsByQuery` takes `max_results`;
+  passing `limit` to either is a hard `TOOL_RUNTIME_BAD_INPUT_VALUE`.
+
+`read_gmail` picks the search tool when given a query and the list tool otherwise, and
+passes `exclude_automated: False` to preserve the old server's unfiltered behaviour. Flip
+it to `True` to drop promotions/social/updates and no-reply senders.
+
+Smithery reports tool and auth failures **inside a normal envelope with exit code 0**
+(`isError: true`), so `_decode_smithery` checks `isError` first and surfaces the text; that
+is why an expired grant used to read as `{"error":"error: unknown error"}`.
 
 ### 5.16 `hotwords/hotword_recog.py` (179 lines)
 
@@ -1610,8 +1666,10 @@ listening — it adds a caregiver **care plan** and family **email** on top.
   urgency)` (emails all alert contacts on distress/emergency + logs it), `send_care_email(to,subject,body)`
   (used by the daily-summary worker). Email goes through a **Gmail MCP**: `send_care_email` reads
   `senior_mode.email.{connection,tool,arg_map}` and calls `smithery_cli.tool_call` (same path as
-  `self_extend_tool_call`). **One-time setup**: `smithery mcp add <gmail>`, `self_extend_tool_list <conn>`
-  to find the send tool + args, then fill `senior_mode.email` in config.
+  `self_extend_tool_call`). Configured 2026-08-28 as `connection: "gmail"`,
+  `tool: "Gmail_SendEmail"`, `arg_map.to: "recipient"` (that server names the recipient
+  field `recipient`, not `to`). Sending needs the `gmail.send` scope on the Arcade grant,
+  which the read-only setup link does NOT include — see §5.15a.
 - **Per-mode `main_tools`**: `core/llm.py _effective_main_tools()` honors an optional
   `assistant_modes.modes.<mode>.main_tools` override (senior adds the care/alert tools), else the global
   `llm.main_tools`. Cache-safe — a mode switch already replaces msg[0] and re-warms (§4).
