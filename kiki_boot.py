@@ -150,18 +150,18 @@ def _run_quiet(command, timeout=8):
         return None
 
 
-def _find_paired_bluetooth_device(target_name):
-    """Return the MAC for a paired device whose name matches target_name."""
-    wanted = " ".join(str(target_name).casefold().split())
-    if not wanted:
-        return None
-
-    # bluetoothctl renamed paired-devices to "devices Paired"; support both
-    # versions because Raspberry Pi OS images may carry either BlueZ CLI.
-    for command in (
-        ["bluetoothctl", "devices", "Paired"],
-        ["bluetoothctl", "paired-devices"],
-    ):
+def _bluetooth_devices(paired_only=False):
+    """Return [(MAC, normalized name)] from a bluetoothctl device listing."""
+    if paired_only:
+        # bluetoothctl renamed paired-devices to "devices Paired"; support both
+        # versions because Raspberry Pi OS images may carry either BlueZ CLI.
+        commands = (
+            ["bluetoothctl", "devices", "Paired"],
+            ["bluetoothctl", "paired-devices"],
+        )
+    else:
+        commands = (["bluetoothctl", "devices"],)
+    for command in commands:
         result = _run_quiet(command)
         if not result or result.returncode != 0:
             continue
@@ -169,25 +169,110 @@ def _find_paired_bluetooth_device(target_name):
             (mac.upper(), " ".join(name.casefold().split()))
             for mac, name in _DEVICE_RE.findall(result.stdout)
         ]
-        exact = next((mac for mac, name in devices if name == wanted), None)
-        if exact:
-            return exact
-        partial = next(
-            (mac for mac, name in devices if wanted in name or name in wanted),
-            None,
-        )
-        if partial:
-            return partial
-    return None
+        if devices:
+            return devices
+    return []
 
 
-def _bluetooth_is_connected(mac):
+def _match_device_name(devices, target_name):
+    """Best MAC for target_name: exact, then substring, then word overlap."""
+    wanted = " ".join(str(target_name).casefold().split())
+    if not wanted or not devices:
+        return None
+    exact = next((mac for mac, name in devices if name == wanted), None)
+    if exact:
+        return exact
+    partial = next(
+        (mac for mac, name in devices if wanted in name or name in wanted),
+        None,
+    )
+    if partial:
+        return partial
+    # A vendor can ship the same speaker under a slightly different broadcast
+    # name than the one in config.json ("Example Speaker" vs "Example Speaker Pro").
+    # The distinctive words still overlap, so fall back to the best overlap.
+    wanted_words = set(wanted.split())
+    best_mac, best_score = None, 0
+    for mac, name in devices:
+        score = len(wanted_words & set(name.split()))
+        if score > best_score:
+            best_mac, best_score = mac, score
+    if best_mac:
+        log(f"matched Bluetooth speaker {target_name!r} loosely to {best_mac}")
+    return best_mac
+
+
+def _find_paired_bluetooth_device(target_name):
+    """Return the MAC for a paired device whose name matches target_name."""
+    return _match_device_name(_bluetooth_devices(paired_only=True), target_name)
+
+
+def _bluetooth_info_says(mac, field):
+    """True when `bluetoothctl info` reports "<field>: yes" for the device."""
     result = _run_quiet(["bluetoothctl", "info", mac])
     return bool(
         result
         and result.returncode == 0
-        and re.search(r"^\s*Connected:\s*yes\s*$", result.stdout, re.MULTILINE)
+        and re.search(rf"^\s*{field}:\s*yes\s*$", result.stdout, re.MULTILINE)
     )
+
+
+def _bluetooth_is_connected(mac):
+    return _bluetooth_info_says(mac, "Connected")
+
+
+# BlueZ only reports these when nothing answered the page at all, i.e. the
+# speaker is switched off or out of range. Every other failure means something
+# did answer, so the pairing is the suspect and may be rebuilt.
+_ABSENT_MARKERS = (
+    "page-timeout",
+    "not available",
+    "unreachable",
+    "host is down",
+    "no route",
+)
+
+
+def _bluetooth_is_present(mac):
+    """True when the controller can currently see the device.
+
+    A bonded BR/EDR speaker stops answering inquiry once it is paired, so RSSI
+    alone would report every working speaker as absent. The connection attempt
+    itself is the reliable probe, and this only backstops it.
+    """
+    if _bluetooth_is_connected(mac):
+        return True
+    result = _run_quiet(["bluetoothctl", "info", mac])
+    return bool(
+        result
+        and result.returncode == 0
+        and re.search(r"^\s*RSSI:", result.stdout, re.MULTILINE)
+    )
+
+
+def _bluetooth_connect(mac):
+    """Attempt one connection. Returns (connected, the speaker answered)."""
+    result = _run_quiet(["bluetoothctl", "connect", mac], timeout=12)
+    output = ""
+    if result is not None:
+        output = f"{result.stdout}\n{result.stderr}".casefold()
+    connected = _bluetooth_is_connected(mac)
+    # A speaker with a stale bond still completes the ACL ("Connected: yes")
+    # and then refuses the audio profile -- br-connection-refused. That is a
+    # switched-on speaker, and exactly the state re-pairing repairs.
+    answered = connected or (
+        "failed to connect" in output
+        and not any(marker in output for marker in _ABSENT_MARKERS)
+    )
+    if not connected and output.strip():
+        reason = next(
+            (line.strip() for line in reversed(output.splitlines())
+             if "failed to connect" in line),
+            "",
+        )
+        if reason:
+            log(f"connect refused by {mac}: {reason}")
+    return connected, answered
 
 
 def _select_bluetooth_audio_sink(mac, timeout_seconds=10):
@@ -229,6 +314,140 @@ def _select_bluetooth_audio_sink(mac, timeout_seconds=10):
     return False
 
 
+def _connect_bluetooth_loop(name, mac, deadline, retry_seconds):
+    """Connect and route the speaker until deadline.
+
+    Returns (ok, mac, answered) where ``answered`` records whether the speaker
+    ever responded, so a failure can be told apart from a powered-off speaker.
+    """
+    answered = False
+    while time.monotonic() < deadline:
+        if not mac:
+            mac = _find_paired_bluetooth_device(name)
+        if not mac:
+            log(f"paired Bluetooth speaker not found: {name}")
+        elif _bluetooth_is_connected(mac):
+            answered = True
+            log(f"Bluetooth speaker already connected: {name} ({mac})")
+            if _select_bluetooth_audio_sink(
+                    mac, min(10, max(0, deadline - time.monotonic()))):
+                return True, mac, answered
+            # BlueZ can say Connected while Pulse/PipeWire has not created an
+            # A2DP sink. Reconnect once instead of reporting false success and
+            # letting the rest of Kiki start on auto_null (Dummy Output).
+            log("Bluetooth is connected but has no selectable A2DP sink; reconnecting")
+            _run_quiet(["bluetoothctl", "disconnect", mac], timeout=8)
+            connected, _ = _bluetooth_connect(mac)
+            if connected and _select_bluetooth_audio_sink(
+                    mac, min(10, max(0, deadline - time.monotonic()))):
+                return True, mac, answered
+        else:
+            log(f"connecting Bluetooth speaker: {name} ({mac})")
+            connected, replied = _bluetooth_connect(mac)
+            answered = answered or replied
+            if connected:
+                log(f"Bluetooth speaker connected: {name} ({mac})")
+                if _select_bluetooth_audio_sink(
+                        mac, min(10, max(0, deadline - time.monotonic()))):
+                    return True, mac, answered
+                log("Bluetooth connected, but A2DP routing is not ready")
+            # If the configured address became stale after re-pairing, fall
+            # back to the paired device name for the next attempt.
+            paired_mac = _find_paired_bluetooth_device(name)
+            if paired_mac and paired_mac != mac:
+                log(f"found {name} at a new Bluetooth address: {paired_mac}")
+                mac = paired_mac
+        time.sleep(min(retry_seconds, max(0, deadline - time.monotonic())))
+    return False, mac, answered
+
+
+def _bluetooth_scan(seconds):
+    """Run one inquiry so BlueZ (re)discovers nearby devices."""
+    _run_quiet(["bluetoothctl", "--timeout", str(int(seconds)), "scan", "on"],
+               timeout=seconds + 15)
+
+
+def _repair_bluetooth_pairing(name, mac, settings, answered=False):
+    """Unpair the speaker and pair it from scratch. Returns its MAC or None.
+
+    BlueZ can hold a bond the speaker itself has forgotten -- after a factory
+    reset, or after it was paired to a phone. The ACL then still completes
+    ("Connected: yes") while the speaker refuses the audio profile with
+    br-connection-refused, so no A2DP sink is ever created and every plain
+    `connect` retries forever. Deleting the link key and pairing again is the
+    only way out.
+    """
+    scan_seconds = max(4.0, float(settings.get("repair_scan_seconds", 12)))
+
+    # Prove the speaker is really there before deleting its pairing: a
+    # switched-off speaker must keep the bond, because rebuilding one needs
+    # somebody standing next to it holding the pairing button.
+    if not answered:
+        log(f"re-pairing {name}: scanning {scan_seconds:g}s for the speaker")
+        _bluetooth_scan(scan_seconds)
+    known = _bluetooth_devices()
+    target = mac if mac and any(m == mac for m, _ in known) else None
+    if not target:
+        target = _match_device_name(known, name)
+    if not target:
+        log(f"re-pair skipped: {name} was not found; leaving its pairing intact")
+        return None
+    if not answered and not _bluetooth_is_present(target):
+        log(f"re-pair skipped: {name} never answered; leaving its pairing intact")
+        return None
+
+    stale = [old for old in (mac, target) if old]
+    named = _match_device_name(_bluetooth_devices(paired_only=True), name)
+    if named and named not in stale:
+        stale.append(named)
+    for old in dict.fromkeys(stale):
+        log(f"removing stale Bluetooth pairing: {old}")
+        _run_quiet(["bluetoothctl", "disconnect", old], timeout=8)
+        _run_quiet(["bluetoothctl", "remove", old], timeout=8)
+
+    # `remove` drops the device from BlueZ entirely -- `pair` answers "not
+    # available" until a fresh inquiry finds it again.
+    log(f"re-pairing {name}: scanning {scan_seconds:g}s for the speaker")
+    _bluetooth_scan(scan_seconds)
+    found = _bluetooth_devices()
+    if not any(m == target for m, _ in found):
+        rediscovered = _match_device_name(found, name)
+        if not rediscovered:
+            log(f"re-pair failed: {name} did not reappear after unpairing "
+                f"(hold its pairing button, then reboot)")
+            return None
+        target = rediscovered
+
+    log(f"pairing Bluetooth speaker: {name} ({target})")
+    _run_quiet(["bluetoothctl", "pair", target], timeout=40)
+    _run_quiet(["bluetoothctl", "trust", target], timeout=8)
+    if not _bluetooth_info_says(target, "Paired"):
+        log(f"re-pair failed: {name} ({target}) did not pair "
+            f"(put the speaker in pairing mode, then reboot)")
+        return None
+    _bluetooth_connect(target)
+    log(f"re-paired Bluetooth speaker: {name} ({target})")
+    return target
+
+
+def _persist_speaker_mac(mac):
+    """Save a re-paired speaker's address so the next boot finds it first."""
+    try:
+        with open(CONFIG) as f:
+            saved = json.load(f)
+        saved.setdefault("bluetooth_speaker", {})["mac"] = mac
+        temp_path = CONFIG + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(saved, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, CONFIG)
+        log(f"saved the speaker's new Bluetooth address to config.json: {mac}")
+    except Exception as e:
+        log(f"could not save the new Bluetooth address: {e}")
+
+
 def connect_bluetooth_speaker(settings):
     """Connect the configured paired speaker before the audible boot sequence."""
     if not settings.get("enabled", True):
@@ -241,48 +460,30 @@ def connect_bluetooth_speaker(settings):
         r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", configured_mac) else None
     timeout_seconds = max(1, float(settings.get("connect_timeout_seconds", 30)))
     retry_seconds = max(0.25, float(settings.get("retry_interval_seconds", 2)))
-    deadline = time.monotonic() + timeout_seconds
 
     powered = _run_quiet(["bluetoothctl", "power", "on"])
     if not powered or powered.returncode != 0:
         log("could not power on the Bluetooth controller")
         return False
 
-    while time.monotonic() < deadline:
-        if not mac:
-            mac = _find_paired_bluetooth_device(name)
-        if not mac:
-            log(f"paired Bluetooth speaker not found: {name}")
-        elif _bluetooth_is_connected(mac):
-            log(f"Bluetooth speaker already connected: {name} ({mac})")
-            if _select_bluetooth_audio_sink(
-                    mac, min(10, max(0, deadline - time.monotonic()))):
-                return True
-            # BlueZ can say Connected while Pulse/PipeWire has not created an
-            # A2DP sink. Reconnect once instead of reporting false success and
-            # letting the rest of Kiki start on auto_null (Dummy Output).
-            log("Bluetooth is connected but has no selectable A2DP sink; reconnecting")
-            _run_quiet(["bluetoothctl", "disconnect", mac], timeout=8)
-            _run_quiet(["bluetoothctl", "connect", mac], timeout=12)
-            if _bluetooth_is_connected(mac) and _select_bluetooth_audio_sink(
-                    mac, min(10, max(0, deadline - time.monotonic()))):
-                return True
-        else:
-            log(f"connecting Bluetooth speaker: {name} ({mac})")
-            _run_quiet(["bluetoothctl", "connect", mac], timeout=12)
-            if _bluetooth_is_connected(mac):
-                log(f"Bluetooth speaker connected: {name} ({mac})")
-                if _select_bluetooth_audio_sink(
-                        mac, min(10, max(0, deadline - time.monotonic()))):
-                    return True
-                log("Bluetooth connected, but A2DP routing is not ready")
-            # If the configured address became stale after re-pairing, fall
-            # back to the paired device name for the next attempt.
-            paired_mac = _find_paired_bluetooth_device(name)
-            if paired_mac and paired_mac != mac:
-                log(f"found {name} at a new Bluetooth address: {paired_mac}")
-                mac = paired_mac
-        time.sleep(min(retry_seconds, max(0, deadline - time.monotonic())))
+    ok, mac, answered = _connect_bluetooth_loop(
+        name, mac, time.monotonic() + timeout_seconds, retry_seconds)
+
+    # Every ordinary reconnect failed. Before giving up, treat the bond itself
+    # as the suspect: unpair and pair again, then retry the same connect loop.
+    if not ok and settings.get("repair_pairing", True):
+        repaired = _repair_bluetooth_pairing(name, mac, settings, answered)
+        if repaired:
+            mac = repaired
+            ok, mac, _ = _connect_bluetooth_loop(
+                name, mac, time.monotonic() + min(timeout_seconds, 20.0),
+                retry_seconds)
+
+    if ok:
+        if mac and mac != configured_mac:
+            settings["mac"] = mac
+            _persist_speaker_mac(mac)
+        return True
 
     log(f"Bluetooth speaker unavailable after {timeout_seconds:g}s: {name}")
     return False

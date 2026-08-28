@@ -8,6 +8,7 @@ the active mpv subprocess.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -20,10 +21,63 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from core.audio_output import ensure_bluetooth_sink, playback_environment
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_LIBRARY_PATH = _PROJECT_ROOT / "liked_songs.json"
 _DEFAULT_ALARM_PATH = _PROJECT_ROOT / "sound_effects" / "soundeffects" / "timer.mp3"
+
+# yt-dlp enables only deno by default and deprecates YouTube extraction with no
+# JavaScript runtime at all. Without one, signature deciphering silently fails
+# and every googlevideo stream URL it hands back answers 403, so mpv exits at
+# once and music "just doesn't play".
+_JS_RUNTIMES = ("node", "quickjs", "bun")
+
+
+@functools.lru_cache(maxsize=4)
+def _yt_dlp_js_flags(binary: str) -> Tuple[str, ...]:
+    """Flags naming every installed JS runtime this yt-dlp build accepts."""
+    try:
+        help_text = subprocess.run(
+            [binary, "--help"], capture_output=True, text=True,
+            timeout=20, check=False,
+        ).stdout
+    except Exception:
+        return ()
+    if "--js-runtimes" not in help_text:
+        return ()  # older yt-dlp: the option does not exist and would abort
+    flags: List[str] = []
+    for runtime in _JS_RUNTIMES:
+        if shutil.which(runtime):
+            flags.extend(["--js-runtimes", runtime])
+    return tuple(flags)
+
+
+def _playback_environment() -> Dict[str, str]:
+    """Environment pinning a player process to Kiki's Bluetooth speaker.
+
+    PulseAudio leaves ``auto_null`` as the default sink after the A2DP sink
+    drops and returns, so an unpinned mpv plays into the dummy output while
+    speech -- which pins its own sink in ``core/tts.py`` -- still comes out of
+    the speaker. That looks exactly like a song that refuses to play.
+
+    ``reconnect=False`` on purpose: activating the A2DP profile repairs the
+    ordinary auto_null case in milliseconds, while a full BlueZ reconnect would
+    stall "play some music" for the length of a `bluetoothctl connect` timeout
+    whenever the speaker is switched off. Reconnecting belongs to boot and to
+    ``core/tts.py``, which re-checks on every utterance. An empty sink returns
+    an unpinned environment so music still plays rather than failing closed.
+    """
+    try:
+        from tools_and_config.config_loader import get_full_config
+        settings = get_full_config().get("bluetooth_speaker", {}) or {}
+        sink = ensure_bluetooth_sink(
+            settings, reconnect=False, timeout_seconds=0.0)
+    except Exception as exc:
+        print(f"[Music] Could not confirm the Bluetooth sink: {exc}")
+        sink = ""
+    return playback_environment(sink)
 
 
 def _atomic_json_write(path: Path, data: dict) -> None:
@@ -113,8 +167,10 @@ class MusicManager:
     def _resolve(self, query_or_url: str, config: dict) -> Tuple[Optional[dict], str]:
         target = query_or_url if query_or_url.startswith(("http://", "https://")) else f"ytsearch1:{query_or_url}"
         timeout = max(5.0, min(float(config.get("search_timeout_seconds", 20)), 25.0))
+        binary = self._yt_dlp(config)
         command = [
-            self._yt_dlp(config),
+            binary,
+            *_yt_dlp_js_flags(binary),
             "--dump-single-json",
             "--no-playlist",
             "-f",
@@ -183,6 +239,24 @@ class MusicManager:
         except Exception:
             pass
 
+    @staticmethod
+    def _player_failure(player: str, return_code: int, errors) -> str:
+        """Explain an instant player exit using the player's own last words."""
+        detail = ""
+        try:
+            errors.seek(0)
+            lines = [line.strip() for line in errors.read().splitlines() if line.strip()]
+            if lines:
+                detail = f": {lines[-1][:160]}"
+        except Exception:
+            pass
+        finally:
+            try:
+                errors.close()
+            except Exception:
+                pass
+        return f"{player} exited immediately (code {return_code}){detail}"
+
     def _stop_locked(self) -> None:
         proc = self._process
         self._process = None
@@ -219,19 +293,24 @@ class MusicManager:
 
             player = config.get("player_command", "mpv")
             player_path = shutil.which(player) or player
+            # Keep the player's own diagnostics: an expired or 403 stream URL
+            # kills mpv within a second, and the reason is the only thing that
+            # tells the difference from a dead speaker.
+            errors = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
             try:
                 proc = subprocess.Popen(
                     [player_path, "--no-video", "--really-quiet", stream_url],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=errors,
                     start_new_session=True,
+                    env=_playback_environment(),
                 )
                 time.sleep(0.6)
                 if should_cancel and should_cancel():
                     proc.kill()
                     return False, "stopped by hand gesture"
                 if proc.poll() is not None:
-                    return False, f"mpv exited immediately (code {proc.returncode})"
+                    return False, self._player_failure(player, proc.returncode, errors)
             except Exception as exc:
                 return False, str(exc)
 
@@ -461,6 +540,7 @@ class TimerManager:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
+                    env=_playback_environment(),
                 )
                 print(f"[Timer] Alarm {timer_id} firing via PID {proc.pid}")
             except Exception as exc:

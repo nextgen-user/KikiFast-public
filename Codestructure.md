@@ -86,6 +86,7 @@ KikiFast/
 │   ├── speech_recorder.py      # record_enabled: off-path wav archive of what Kiki actually said (§5.5a)
 │   ├── tts_sync.py             # Calibration-profile word timing; no runtime Whisper dependency
 │   ├── media_manager.py        # Exact-video music state/likes/playlist controls + timer alarms
+│   │                           # mpv + timer alarm are pinned to the A2DP sink (§8.15a)
 │   ├── lcd_display.py          # 16x2 I2C char-LCD status/streaming display (singleton, async worker)
 │   ├── oled_display.py         # 128x64 SSD1306 pixel-crab face: 35 states + <oled:> expression tags (§5.18f)
 │   ├── oled_log_feed.py        # stdout/stderr tap → the resting face's background-activity ticker
@@ -156,6 +157,33 @@ connects the paired `bluetooth_speaker` (Example Speaker; configured MAC first w
 discovery as fallback), waits for its A2DP PulseAudio sink, and selects that sink as default.
 It retries for `connect_timeout_seconds`; by default a powered-off speaker is logged but does
 not prevent Kiki from booting (`required: false`).
+
+Name discovery is deliberately loose — exact match, then substring, then best word overlap —
+because a speaker can broadcast a name the config never learned (`Example Speaker` in
+`config.json` vs `Example Speaker Pro` over the air). A loose match is logged.
+
+When every ordinary reconnect fails, the orchestrator treats the **bond itself** as the
+suspect and re-pairs (`_repair_bluetooth_pairing`). BlueZ can hold a link key the speaker
+has forgotten — after a factory reset, or after it was paired to a phone. The ACL then still
+completes (`Connected: yes`) while the speaker refuses the audio profile with
+`br-connection-refused`, so no A2DP sink is ever created and a plain `connect` retries
+forever. Recovery is `disconnect` → `remove` → **scan again** → `pair` → `trust` → `connect`,
+followed by a second connect loop capped at 20s. The order is load-bearing in both
+directions:
+
+- The scan **after** `remove` is mandatory. `remove` drops the device from BlueZ entirely,
+  and `pair` answers `Device … not available` until a fresh inquiry rediscovers it.
+- The bond is only deleted once the speaker has proven it is switched on. Presence comes
+  from `_bluetooth_connect`, which reads the failure text: everything except a page timeout
+  or "not available" means something answered. RSSI is only a backstop, because a bonded
+  BR/EDR speaker stops answering inquiry and would otherwise look absent every time.
+  A speaker that is merely powered off keeps its pairing — rebuilding one needs somebody
+  standing next to it holding the pairing button.
+
+A successful re-pair at a new address updates `bluetooth_speaker.mac` in memory and writes
+it back to `config.json` (`_persist_speaker_mac`), so the next boot finds the speaker first.
+Set `bluetooth_speaker.repair_pairing: false` to disable the whole recovery, or
+`repair_scan_seconds` (default 12) to change the inquiry window.
 
 After Bluetooth audio is ready, `core/startup_config.py` briefly takes ownership of
 GPIO22/17 and offers `Edit config?` on the LCD. Tap LEFT/RIGHT to navigate and hold either
@@ -1684,6 +1712,7 @@ listening — it adds a caregiver **care plan** and family **email** on top.
 
 | Block | Key points |
 |---|---|
+| `bluetooth_speaker` | Startup speaker connection (§3.0): `name`/`mac`, `connect_timeout_seconds`, `retry_interval_seconds`, `required` (abort boot when offline), `volume_percent`. `repair_pairing` (default true) allows the unpair→pair→connect recovery, and `repair_scan_seconds` (default 12) is its inquiry window. A re-pair at a new address rewrites `mac` here. |
 | `llm` | Foreground speaking provider/model, local endpoint, tools, prompt, and cache controls. |
 | `idle_mind` | The only background cognition configuration: provider/model/fallback/thinking level, state/journal paths, scheduling limits, and tool budgets. |
 | `action_agent` | The `complex_query` multi-step agent (§5.2c): provider (`cerebras` default / `groq` fallback), per-provider model and context caps, turn/tool budgets, and the wall-clock deadline. Cloud-only; never uses the local slot. |
@@ -1776,6 +1805,29 @@ brownouts is the power supply, not git.
     streamer. Regenerate fillers with `python3 tests/streaming_tts.py --generate-fillers`.
 15. **`play_music`/`dance` set `should_skip_followup`** — after them the mic goes straight
     back to hotword mode (no follow-up listening over the music).
+15a. **Every player process must be pinned to the speaker's sink.** mpv (music and timer
+    alarms) inherits PulseAudio's default sink, and that default is `auto_null` whenever the
+    A2DP sink dropped and came back. Speech pins its own sink in `core/tts.py`, so unpinned
+    music is the *only* thing that disappears — it plays into the dummy output at full
+    length with no error anywhere. `core/media_manager.py::_playback_environment()` calls
+    `ensure_bluetooth_sink(reconnect=False)` and passes `PULSE_SINK` to every player it
+    spawns. `reconnect=False` is deliberate: profile activation repairs auto_null in
+    milliseconds, while a full BlueZ reconnect would stall *"play some music"* for a whole
+    `bluetoothctl connect` timeout with the speaker off. Reconnecting belongs to boot and to
+    `core/tts.py`. With no speaker configured or connected the environment is unpinned, so
+    music still plays rather than failing closed.
+15b. **yt-dlp rots, and it fails as silence, not as an error.** A stale build resolves the
+    search fine — right title, right watch URL, `play_music` answers *"Now playing …"* — but
+    the signed googlevideo URL it hands back answers **HTTP 403**, so mpv dies within a
+    second. Two causes, both live: the build being months old, and modern yt-dlp enabling
+    only **deno** by default while this box has **node**. Without a JS runtime signature
+    deciphering fails and every URL 403s. `_yt_dlp_js_flags()` probes `--help` once and
+    passes `--js-runtimes` for each installed runtime (older builds that lack the option get
+    nothing). When a song "doesn't play", check `curl -o /dev/null -w '%{http_code}'` on the
+    resolved stream URL *before* suspecting audio: 403 means upgrade yt-dlp
+    (`/usr/bin/pip3 install -U yt-dlp`), 206 means the problem is the sink.
+    Note `_yt_dlp()` prefers `yt_dlp_path` (venv) over `$PATH` — `/usr/bin/yt-dlp` is a
+    distro package and is usually the stale one.
 16. **Periodic spoken questions** require `run_vision_update(force_trigger=True,
     force_qa=True)` AND a timer reset at the call site — the bare call returns immediately
     with `traditional_context_enabled: false`.

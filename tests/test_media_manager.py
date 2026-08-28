@@ -266,6 +266,108 @@ def test_timer_uses_real_alarm_path_and_no_shell(tmp_path, monkeypatch):
     }
 
     scheduled["callback"]()
-    command, kwargs = launched[0]
+    # The alarm is pinned to the configured speaker, so the sink check runs
+    # first; the player itself is the launch that matters here.
+    command, kwargs = next(
+        (entry for entry in launched if entry[0][0].endswith("mpv")), (None, {}))
     assert command == ["/usr/bin/mpv", "--no-video", "--really-quiet", str(sound)]
     assert "shell" not in kwargs
+    assert "PULSE_SINK" not in kwargs.get("env", {})  # no speaker configured here
+
+
+def test_music_player_is_pinned_to_the_configured_speaker(tmp_path, monkeypatch):
+    # PulseAudio's default sink is auto_null whenever the A2DP sink dropped and
+    # came back. Speech pins its own sink, so unpinned music is the only thing
+    # that vanishes -- it plays into the dummy output with no error at all.
+    sink = "bluez_output.EF_C0_B9_99_69_9C.a2dp-sink"
+    launched = []
+    instance = media.MusicManager(str(tmp_path / "liked.json"))
+
+    monkeypatch.setattr(media, "_playback_environment",
+                        lambda: {"PULSE_SINK": sink})
+    monkeypatch.setattr(media.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(
+        media.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append((command, kwargs)) or FakeProcess(command),
+    )
+    monkeypatch.setattr(media.time, "sleep", lambda _seconds: None)
+
+    entry = {
+        "title": "Blue Monday",
+        "webpage_url": "https://www.youtube.com/watch?v=blue_monday",
+        "video_id": "blue_monday",
+        "stream_url": "https://googlevideo.invalid/signed-audio",
+    }
+    ok, result = instance._play_index([entry], 0, False, {"player_command": "mpv"})
+
+    assert (ok, result) == (True, "Blue Monday")
+    command, kwargs = launched[0]
+    assert command[0] == "/usr/bin/mpv"
+    assert kwargs["env"]["PULSE_SINK"] == sink
+
+
+def test_player_dying_at_once_reports_its_own_error(tmp_path, monkeypatch):
+    # A 403 stream URL (stale yt-dlp, no JS runtime) kills mpv within a second.
+    # Without mpv's own words this is indistinguishable from a dead speaker.
+    instance = media.MusicManager(str(tmp_path / "liked.json"))
+
+    class DeadProcess(FakeProcess):
+        def __init__(self, command, stderr):
+            super().__init__(command)
+            self.returncode = 2
+            stderr.write("Failed to open https://googlevideo.invalid/x.\n")
+
+    monkeypatch.setattr(media, "_playback_environment", dict)
+    monkeypatch.setattr(media.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(
+        media.subprocess,
+        "Popen",
+        lambda command, **kwargs: DeadProcess(command, kwargs["stderr"]),
+    )
+    monkeypatch.setattr(media.time, "sleep", lambda _seconds: None)
+
+    entry = {
+        "title": "Blue Monday",
+        "webpage_url": "https://www.youtube.com/watch?v=blue_monday",
+        "video_id": "blue_monday",
+        "stream_url": "https://googlevideo.invalid/signed-audio",
+    }
+    ok, result = instance._play_index([entry], 0, False, {"player_command": "mpv"})
+
+    assert ok is False
+    assert "mpv exited immediately (code 2)" in result
+    assert "Failed to open" in result
+
+
+def test_resolve_enables_an_installed_javascript_runtime(monkeypatch):
+    # yt-dlp only enables deno by default; without a runtime it hands back
+    # signed URLs that answer 403 and nothing ever plays.
+    media._yt_dlp_js_flags.cache_clear()
+    monkeypatch.setattr(
+        media.shutil, "which",
+        lambda command: "/usr/bin/node" if command == "node" else None)
+    monkeypatch.setattr(
+        media.subprocess, "run",
+        lambda command, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="  --js-runtimes RUNTIME[:PATH]\n", stderr=""))
+
+    try:
+        flags = media._yt_dlp_js_flags("/fake/yt-dlp")
+    finally:
+        media._yt_dlp_js_flags.cache_clear()
+    assert flags == ("--js-runtimes", "node")
+
+
+def test_resolve_omits_the_flag_on_older_ytdlp_builds(monkeypatch):
+    media._yt_dlp_js_flags.cache_clear()
+    monkeypatch.setattr(media.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(
+        media.subprocess, "run",
+        lambda command, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="  --dump-single-json\n", stderr=""))
+
+    try:
+        assert media._yt_dlp_js_flags("/fake/old-yt-dlp") == ()
+    finally:
+        media._yt_dlp_js_flags.cache_clear()
