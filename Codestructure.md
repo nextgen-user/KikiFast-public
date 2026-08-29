@@ -2109,6 +2109,30 @@ the dict mutate mid-render. Active only under the `environment` capability (`hea
 - Wired in `main.py` next to the care bridge: started at boot and toggled by `sync_mode_prompt` on
   the same cache-safe capability boundary.
 
+### 5.25a `core/health/care_snapshot.py` — the `CARE NOW` row
+
+One short system row assembled from the environment provider, the care schedule, and trusted
+vitals — the health-companion equivalent of the time anchor, under the same constraint: every
+character lives in the warm KV prefix and is re-prefilled on every later turn (§4). Measured live
+at 68 characters.
+
+- **Silence is the default.** Only noteworthy facts earn a place: a non-`none` heat band, an AQI
+  worse than `satisfactory`, a care item due within 90 minutes, a trusted reading under 12 h old,
+  or an active session. An ordinary turn produces `""` and injects nothing.
+- **Injected on CHANGE, never on a timer.** `CareNowInjector` appends only when the rendered line
+  differs from the last one, and not before `environment.care_now_cooldown_seconds` (default 900)
+  has passed — so an unchanged AQI never re-enters the prompt, and a reading oscillating across a
+  band edge cannot inject every turn. This is the deterministic layer plan.md asks for under the
+  AI's wording.
+- **Append-only.** "Ephemeral" means *not repeated*, not *retracted*: removing the row would
+  invalidate the warm prefix and cost a full reprefill on the next voice turn.
+- **Every part fails soft and independently.** A broken care plan must not cost the person the
+  air-quality warning, and vice versa; a total failure is silent, never an exception on a voice turn.
+- Injected in `main.py` beside `idle_mgr.maybe_inject_time()`, under the `environment` capability.
+  Unified Idle Mind gets the same snapshot freshly built (`_care_now_line`) plus the active mode and
+  its capabilities (`_active_mode_line`) — it previously had no mode awareness at all, so its
+  proactive thinking was identical whether or not Kiki was looking after someone's health.
+
 ---
 
 ## 6. `tools_and_config/config.json` Reference

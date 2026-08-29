@@ -267,13 +267,16 @@ Caregiver PWA / senior voice request / Unified Idle Mind evidence
 - [x] Mark environment readings stale after 30 minutes and unavailable after two hours. An
   unavailable snapshot carries no values at all, and a failed poll does not reset the timestamp.
 - [ ] Create deterministic normal, attention, and urgent demo telemetry scenarios.
-- [ ] Build one ephemeral compact `CARE NOW` snapshot, target maximum 80 tokens, containing only
+- [x] Build one ephemeral compact `CARE NOW` snapshot, target maximum 80 tokens, containing only
   noteworthy environment/vitals, next due item, medicine state, and active advisory.
-- [ ] Inject the snapshot like the current time anchor immediately before a user turn; do not
-  accumulate repeated telemetry in conversation history.
-- [ ] Give the same compact snapshot and active senior mode to Unified Idle Mind.
-- [ ] Use deterministic risk bands/cooldowns underneath AI wording so unchanged readings do not
-  nag or grow the prompt.
+  `core/health/care_snapshot.py`; measured at 68 characters live.
+- [x] Inject the snapshot like the current time anchor immediately before a user turn; do not
+  accumulate repeated telemetry in conversation history. Injected only when the rendered line
+  CHANGES, and append-only — retracting it would invalidate the warm prefix.
+- [x] Give the same compact snapshot and active senior mode to Unified Idle Mind, which previously
+  had no mode awareness at all.
+- [x] Use deterministic risk bands/cooldowns underneath AI wording so unchanged readings do not
+  nag or grow the prompt. Bands in `environment.py`, change-gate + cooldown in `care_snapshot.py`.
 - [ ] Demonstrate normal, heat, poor-AQI, and simulated-vital cases; verify personalized speech,
   expected alerts, cooldown, stale-data behavior, and no prompt growth.
 - [ ] **Phase G locked on real Kiki.**

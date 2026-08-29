@@ -1995,6 +1995,18 @@ async def main():
                 # to a DAY; the summarizer keys off the "right now it's" marker.
                 idle_mgr.maybe_inject_time(rewarm=False)
 
+                # CARE NOW: environment/vitals/next-due, injected only when it
+                # actually changed (see core/health/care_snapshot.py). Silent on
+                # an ordinary turn, so most turns pay nothing for it.
+                if mode_has_capability("environment"):
+                    try:
+                        from core.health.care_snapshot import (
+                            get_care_now_injector, current_sources)
+                        get_care_now_injector().maybe_inject(
+                            message_history, rewarm=False, **current_sources())
+                    except Exception as _care_now_err:
+                        print(f"[CareNow] skipped: {_care_now_err}")
+
                 if event == "meet_stranger" and not context_enabled("face_events"):
                     # This instruction says "introduce yourself as Kiki", which
                     # breaks a character outright. Drop the whole turn rather
