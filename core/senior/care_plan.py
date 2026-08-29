@@ -317,7 +317,7 @@ class CarePlan:
                           enabled: bool = True, source: str = "user",
                           evidence: str = "", adaptation: Optional[Dict[str, Any]] = None,
                           continuous_vision: bool = False, objective: str = "",
-                          session_brief: str = ""
+                          session_brief: str = "", companion_key: str = ""
                           ) -> Dict[str, Any]:
         title = str(title or "").strip()
         if not title:
@@ -392,6 +392,10 @@ class CarePlan:
             "enabled": bool(enabled),
             "source": source,
             "evidence": evidence,
+            # Stable identity for a seeded companion routine, so re-seeding
+            # recognises it even after the person renames or retimes it. Empty
+            # for everything the person or the care agent created themselves.
+            "companion_key": str(companion_key or "").strip(),
             "adaptation": {
                 "allowed": bool(adaptation.get("allowed", True)),
                 "strategy": str(adaptation.get("strategy", "adapt_to_response")).strip(),

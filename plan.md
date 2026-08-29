@@ -352,15 +352,19 @@ morning briefing, evening reflection, and the food/hydration/walk/sleep follow-u
 `care_voice_agent` — no new session engine, scheduler, or speech path. Only three items need genuinely
 new mechanism: Idle Mind care awareness, the memory-aid sections, and the dashboard.
 
-- [ ] Morning briefing: greeting, weather/AQI, medicine/routine overview, appointments, and a
-  relevant family event. *(seeded routine_event; needs Phase G)*
-- [ ] Evening reflection: confirmed care outcomes, gentle missed-item follow-up, and tomorrow's
-  appointments. *(seeded routine_event)*
-- [ ] Food, hydration, walking, lifestyle, and sleep follow-ups based on the care plan and compact
-  state—supportive and non-shaming. *(seeded routine_events; needs Phase G)*
+- [x] Morning briefing: greeting, weather/AQI, medicine/routine overview, appointments, and a
+  relevant family event. Seeded `routine_event`; the care agent reads live conditions from the
+  `CURRENT OUTSIDE CONDITIONS` block and is told never to estimate a missing reading.
+- [x] Evening reflection: confirmed care outcomes, gentle missed-item follow-up, and tomorrow's
+  appointments. Reads the care log and `session_history`; explicitly forbidden from inferring that
+  a scheduled medicine was taken.
+- [x] Food, hydration, walking, lifestyle, and sleep follow-ups based on the care plan and compact
+  state—supportive and non-shaming. `hydration_checkin`, `movement_checkin`, `sleep_winddown`;
+  the movement brief tells the agent to advise staying IN on a bad-heat or bad-air day.
 - [ ] Inactivity check-ins based on time, available activity evidence, and personal baseline; never
   equate “not visible to camera” with a medical event. *(Unified Idle Mind)*
-- [ ] Mood check-ins and optional caregiver-summary inclusion. *(Unified Idle Mind)*
+- [ ] Mood check-ins and optional caregiver-summary inclusion. Mood is covered inside the evening
+  reflection; the standalone Idle-Mind check-in and caregiver-summary inclusion remain open.
 - [ ] Boredom cure: approved jokes, word games, reminiscence prompts, music, and simple memory/care
   games chosen naturally by Unified Idle Mind. *(NEW MECHANISM: `unified_idle_mind.py` currently has
   no mode awareness and no care context at all. Needs the compact snapshot, the active mode, and a

@@ -2133,6 +2133,35 @@ at 68 characters.
   its capabilities (`_active_mode_line`) — it previously had no mode awareness at all, so its
   proactive thinking was identical whether or not Kiki was looking after someone's health.
 
+### 5.25b `core/health/companion_routines.py` — the Phase H daily experiences
+
+The morning briefing, evening reflection, and lifestyle follow-ups are **care-plan data, not code
+paths**. Per the architecture decision in `plan.md`, a care event stores a rich goal/context
+`session_brief` and the care agent decides how to conduct it — so these are ordinary
+`routine_events` run by the same `care_voice_agent` as everything else. There is no new scheduler,
+no new speech route, and deliberately no script, question list, or branching in any brief; the
+module contains the *writing*, and `tests/test_companion_routines.py` asserts that no brief ever
+grows a quoted line (the live box recites prompt examples verbatim — §8).
+
+Five routines ship: `morning_briefing` (07:30), `hydration_checkin` (11:30), `movement_checkin`
+(17:00), `evening_reflection` (20:30), `sleep_winddown` (22:00), all retimable under `companion.times`.
+
+- **Seeded only under the `companion` capability**, in `main.py` *before*
+  `senior_care_mgr.activate()`, so a freshly seeded briefing is materialized in the same activation.
+- **Idempotent on `companion_key`**, a first-class field on the routine event (not `adaptation`,
+  whose schema is a controlled allow-list that drops unknown keys). Identity survives the person
+  renaming or retiming the event, so their edited copy is never duplicated underneath.
+- **Only ever ADDS.** A routine that is disabled, retimed, or rewritten stays that way — an
+  assistant that silently restores what you turned off is worse than one that never offered it.
+  Deletion is not remembered; `companion.disabled` is the setting that is.
+- The briefs that discuss heat or air quality point explicitly at `CURRENT OUTSIDE CONDITIONS`,
+  the block `care_voice_agent._environment_brief()` adds to every care prompt. That block states
+  the absence of a reading **explicitly** rather than omitting it: a silent gap invites the model to
+  fill it from training data, which is exactly how a fabricated AQI would reach someone deciding
+  whether it is safe to walk. The CPCB estimate caveat travels with it.
+- The evening brief insists on **confirmed** outcomes from the care log and `session_history` —
+  never inferring that a medicine was taken because it was scheduled.
+
 ---
 
 ## 6. `tools_and_config/config.json` Reference

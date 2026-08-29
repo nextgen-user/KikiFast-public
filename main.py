@@ -1081,6 +1081,16 @@ async def main():
         from core.senior.senior_care_manager import set_foreground_hook
         set_foreground_hook(_queue_care_session)
         if mode_has_capability("care"):
+            # Companion modes seed their default daily routines BEFORE the
+            # workers are materialized, so a freshly seeded briefing is
+            # scheduled in the same activation rather than a restart later.
+            if mode_has_capability("companion"):
+                try:
+                    from core.health.companion_routines import ensure_companion_routines
+                    ensure_companion_routines(
+                        get_care_plan_store(), full_config.get("companion", {}))
+                except Exception as _seed_err:
+                    print(f"[Companion] seeding skipped: {_seed_err}")
             senior_care_mgr.activate()
     except Exception as _senior_err:
         print(f"[SeniorCare] init skipped: {_senior_err}")

@@ -321,6 +321,51 @@ async def _fresh_visual_frame(session: dict) -> tuple[Optional[list], str]:
 _WRAP_UP_MARGIN = 5
 
 
+def _environment_brief() -> str:
+    """Live weather/air quality for the care agent, or an explicit absence.
+
+    A morning briefing cannot honestly mention today's heat or air quality
+    unless the model is actually holding the numbers, and the alternative --
+    a tool call on a latency-critical spoken turn -- costs a round trip on
+    every session that mentions the weather.
+
+    The absence is stated explicitly rather than omitted. A silent gap invites
+    the model to fill it from training data, which is exactly how a fabricated
+    AQI reaches someone deciding whether it is safe to go for a walk.
+    """
+    try:
+        from core.runtime_controls import mode_has_capability
+        if not mode_has_capability("environment"):
+            return "Not tracked in this mode. Do not discuss current weather or air quality."
+        from core.health.environment import get_environment_provider
+        snapshot = get_environment_provider().snapshot()
+    except Exception:
+        return "Unavailable. Say you do not have it rather than estimating."
+    if not snapshot.get("available"):
+        return ("Unavailable right now. Say you do not have today's reading "
+                "rather than estimating one.")
+    parts = []
+    if snapshot.get("temperature_c") is not None:
+        parts.append(f"{snapshot['temperature_c']:.0f}C")
+    if snapshot.get("apparent_temperature_c") is not None:
+        parts.append(f"feels {snapshot['apparent_temperature_c']:.0f}C "
+                     f"(heat: {snapshot.get('heat_band')})")
+    if snapshot.get("humidity_pct") is not None:
+        parts.append(f"humidity {snapshot['humidity_pct']:.0f}%")
+    if snapshot.get("aqi") is not None:
+        parts.append(f"AQI ~{snapshot['aqi']} ({snapshot.get('aqi_category')}, "
+                     f"driven by {snapshot.get('aqi_driver')}; PM2.5 "
+                     f"{snapshot.get('pm2_5')}, PM10 {snapshot.get('pm10')})")
+    stale = (" This reading is "
+             f"{round((snapshot.get('age_seconds') or 0) / 60)} minutes old."
+             if snapshot.get("state") == "stale" else "")
+    return (f"{snapshot.get('place') or 'Home'}: " + ", ".join(parts) + "."
+            + stale
+            + " The AQI is an estimate on India's CPCB scale from current hourly"
+              " PM, not an official station reading — describe it plainly and"
+              " never quote it as an official figure.")
+
+
 def _wrap_up_notice(session: dict) -> str:
     """A leading instruction to bring a long session to a close, or ""."""
     remaining = session.get("turns_remaining")
@@ -374,6 +419,9 @@ REAL SESSION TRANSCRIPT (oldest first):
 
 CURRENT VISUAL INPUT:
 {visual_status}
+
+CURRENT OUTSIDE CONDITIONS:
+{_environment_brief()}
 
 CURRENT PERSON SPEECH:
 {user_text if user_text.strip() else '[The scheduled session has just begun; nobody has replied yet.]'}
