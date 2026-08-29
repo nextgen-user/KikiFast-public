@@ -70,11 +70,28 @@ DEFAULT_STRUCTURE: Dict[str, Any] = {
     "approved_music": [],       # ["song / query", ...]
     "approved_topics": [],      # ["cricket", "old bollywood", ...]
     "care_log": [],             # {ts, kind, text}
+    "session_history": [],      # compact finished-session records (evening reflection)
     "health_measurements": [], # trusted numeric readings for trend analysis
     "metadata": {"created": "", "last_updated": ""},
 }
 
 _MAX_CARE_LOG = 500
+_MAX_SESSION_HISTORY = 60
+
+# A finished session's `care_context` is a frozen copy of the WHOLE care plan,
+# kept only so a stateless API can be re-sent an identical prefix mid-session.
+# Once the session ends it is 15 kB of dead weight that outlives its purpose --
+# measured on the live plan, one finished session was 18 kB of a 43 kB file, and
+# nothing ever removed it. It is dropped at completion; the transcript, which is
+# the part with lasting value, is kept.
+_FINISHED_SESSION_DROP = ("care_context",)
+
+# Hard ceiling on real turns in one session. The 19:07 neck session ran eight
+# turns and kept going because the model is the ONLY thing that ever emitted
+# `session: "complete"` -- and a model told "usually it is continue" continues.
+# The 20-minute idle timeout was the sole backstop, which does not help at all
+# while the person is still talking.
+_DEFAULT_MAX_SESSION_TURNS = 40
 
 
 class CarePlan:
@@ -121,6 +138,13 @@ class CarePlan:
                 for row in (old_session.get("responses") or [])
             ]
             old_session["turn_count"] = len(old_session["transcript"])
+        # Self-heal a plan written before sessions were archived: a session that
+        # is already over has no business still carrying the frozen plan copy.
+        if (isinstance(old_session, dict)
+                and old_session.get("status") not in (None, "active")
+                and any(key in old_session for key in _FINISHED_SESSION_DROP)):
+            for key in _FINISHED_SESSION_DROP:
+                old_session.pop(key, None)
         return data
 
     def save(self) -> bool:
@@ -562,7 +586,56 @@ class CarePlan:
             raise IOError("could not persist care-session vision setting")
         return self.care_session_state()
 
-    def finish_care_session(self, status: str = "completed", response: str = "") -> Dict[str, Any]:
+    def max_session_turns(self) -> int:
+        """Hard ceiling on real turns in one session. 0 disables it."""
+        try:
+            cfg = (get_full_config().get("senior_mode", {})
+                   .get("care_agent", {}) or {})
+            return max(0, int(cfg.get("max_session_turns",
+                                      _DEFAULT_MAX_SESSION_TURNS)))
+        except Exception:
+            return _DEFAULT_MAX_SESSION_TURNS
+
+    def _close_session(self, session: Dict[str, Any], status: str,
+                       reason: str = "") -> None:
+        """Mark a session over, strip its dead weight, and archive it.
+
+        Caller must hold ``self._lock`` and must save afterwards. `active_session`
+        deliberately keeps holding the finished record rather than being set to
+        None: "what happened in the last session" is a real question the WebUI,
+        the tools, and the evening reflection all ask, and `start_care_session`
+        already treats any non-active status as unblocked.
+        """
+        now = datetime.now().isoformat()
+        session["status"] = status
+        session["updated_at"] = now
+        session["completed_at"] = now
+        if reason:
+            session["end_reason"] = reason
+        for key in _FINISHED_SESSION_DROP:
+            session.pop(key, None)
+
+        transcript = session.get("transcript") or []
+        history = self.data.setdefault("session_history", [])
+        history.append({
+            "id": session.get("id", ""),
+            "event_id": session.get("event_id", ""),
+            "event_title": session.get("event_title", ""),
+            "status": status,
+            "end_reason": reason,
+            "started_at": session.get("started_at", ""),
+            "completed_at": now,
+            "turn_count": int(session.get("turn_count", 0) or 0),
+            # The last exchange is what an evening reflection actually needs:
+            # how the session ended, in the person's own words and Kiki's.
+            "last_user": str((transcript[-1] or {}).get("user", ""))[:400] if transcript else "",
+            "last_assistant": str((transcript[-1] or {}).get("assistant", ""))[:400] if transcript else "",
+        })
+        if len(history) > _MAX_SESSION_HISTORY:
+            del history[:len(history) - _MAX_SESSION_HISTORY]
+
+    def finish_care_session(self, status: str = "completed", response: str = "",
+                            reason: str = "") -> Dict[str, Any]:
         status = str(status or "completed").strip().lower()
         if status not in {"completed", "cancelled", "declined"}:
             raise ValueError("session status must be completed, cancelled, or declined")
@@ -578,9 +651,7 @@ class CarePlan:
                     "note": f"Session {status} by conversational agent/user.",
                     "tools_used": [],
                 })
-            session["status"] = status
-            session["updated_at"] = datetime.now().isoformat()
-            session["completed_at"] = datetime.now().isoformat()
+            self._close_session(session, status, reason)
         if not self.save():
             raise IOError("could not persist care-session completion")
         return self.care_session_state()
@@ -625,12 +696,11 @@ class CarePlan:
             if idle < timeout:
                 return False
             title = session.get("event_title", "Care session")
-            session["status"] = "abandoned"
-            session["updated_at"] = datetime.now().isoformat()
-            session["completed_at"] = datetime.now().isoformat()
-            session["abandoned_reason"] = (
+            abandoned_reason = (
                 f"no activity for {idle / 60:.0f} min (timeout "
                 f"{timeout / 60:.0f} min)")
+            session["abandoned_reason"] = abandoned_reason
+            self._close_session(session, "abandoned", abandoned_reason)
         self.add_care_log(
             "care_session",
             f"{title} ended as abandoned after {idle / 60:.0f} min of silence.")
@@ -655,7 +725,24 @@ class CarePlan:
                 session["continuous_vision"] = (
                     override if isinstance(override, bool)
                     else bool(event.get("continuous_vision", False)))
+            limit = self.max_session_turns()
+            turns = int(session.get("turn_count", 0) or 0)
+            session["turn_limit"] = limit
+            session["turns_remaining"] = max(0, limit - turns) if limit else None
+            session["turn_limit_reached"] = bool(limit and turns >= limit)
             return session
+
+    def session_history_since(self, iso_ts: str) -> List[Dict[str, Any]]:
+        """Finished sessions completed at or after ``iso_ts``.
+
+        What an evening reflection reads to talk about the day using CONFIRMED
+        outcomes: each record says how a session actually ended, not what the
+        care plan hoped would happen.
+        """
+        with self._lock:
+            history = json.loads(json.dumps(self.data.get("session_history") or []))
+        return [row for row in history
+                if str(row.get("completed_at", "")) >= str(iso_ts)]
 
     def add_family_contact(self, name: str, email: str, relationship: str = "",
                            notify_on: Optional[List[str]] = None) -> Dict[str, Any]:

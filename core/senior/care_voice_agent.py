@@ -51,6 +51,80 @@ _LAST_DIRECTIVE: Dict[str, Any] = {
 # session just by omitting or inventing a value.
 _REPLY_REASONS = {"aborted", "incorrect_form", "safety", "choice"}
 
+# Deterministic "the person asked to stop", underneath the model's wording.
+#
+# Ending a session used to depend ENTIRELY on the model choosing to emit
+# `session: "complete"`, and the same prompt tells it "usually it is continue".
+# The observed result was an eight-turn neck session that never ended, held the
+# care lock against every other due routine, and swallowed unrelated
+# conversation until the idle timeout fired twenty minutes later.
+#
+# So a clear spoken stop now ends the session whatever the model returns. These
+# are deliberately unambiguous exit phrases, not general negatives: "no" and
+# "नहीं" are ordinary answers inside a care conversation ("any pain?" -> "no")
+# and must never end it. Anchored to word boundaries so "बसंत" is not "बस" and
+# "stopwatch" is not "stop".
+# A bare "stop" is unambiguous as the WHOLE utterance and ambiguous inside a
+# sentence -- "I do not want to stop" is the opposite instruction. So the single
+# words are matched only as a complete utterance, and anything embedded in a
+# longer sentence has to carry more evidence than one word.
+_STANDALONE_STOP = {
+    "stop", "enough", "done", "finish", "finished", "cancel",
+    "बस", "रुको", "रुकिए", "खत्म", "ख़त्म", "रोको", "रोक दो", "रुक जाओ",
+    "बंद करो", "छोड़ो", "रहने दो",
+}
+
+_STOP_PHRASES_EN = (
+    r"stop (?:it|now|this|there|the (?:session|exercise|routine))",
+    r"(?:i am|i'm|im) done", r"that(?:'s| is) (?:enough|all)",
+    r"no more", r"enough for (?:now|today)", r"let(?:'s| us) stop",
+    r"finish(?:ed)? (?:now|here|for today)", r"cancel (?:this|the session)",
+    r"end (?:the )?session", r"we(?:'re| are) done",
+)
+_STOP_PHRASES_HI = (
+    r"बस करो", r"बस कीजिए", r"बस अब", r"रुक जाओ", r"रोक दो", r"बंद करो",
+    r"नहीं करना", r"नहीं करूँगा", r"नहीं करूंगा", r"आज नहीं", r"अभी नहीं",
+    r"रहने दो", r"खत्म करो", r"ख़त्म करो",
+)
+_STOP_RE_EN = re.compile(r"\b(?:" + "|".join(_STOP_PHRASES_EN) + r")\b", re.IGNORECASE)
+# Devanagari has no \b that Python's re understands the way Latin does, so the
+# Hindi side is bounded by explicit non-Devanagari edges instead. Without this,
+# "बसंत" (spring) contains "बस" and would end the session.
+_STOP_RE_HI = re.compile(
+    r"(?:^|[^ऀ-ॿ])(?:" + "|".join(_STOP_PHRASES_HI) + r")(?:$|[^ऀ-ॿ])")
+
+# Said INSIDE a longer sentence, these reverse the meaning of a stop word.
+_STOP_NEGATION_RE = re.compile(
+    r"\b(?:do not|don'?t|never|can'?t|cannot|won'?t)\b[^.?!]{0,40}\bstop\b"
+    r"|\bnot\s+(?:want|going)\b[^.?!]{0,20}\bstop\b"
+    r"|(?:रुकना|रोकना|छोड़ना|बंद)\s*नहीं",
+    re.IGNORECASE)
+
+_STOP_PUNCT_RE = re.compile(r"[\s।,.!?\-]+")
+
+
+def user_asked_to_stop(text: str) -> bool:
+    """True when the person clearly asked to end the session.
+
+    Kept conservative on purpose, and in this direction: a false positive cuts
+    a session the person wanted, which they recover from in one sentence; the
+    failure it replaces -- a session that never ends, holds the care lock, and
+    swallows unrelated conversation -- lasted twenty minutes.
+
+    Note "no" and "नहीं" are deliberately absent. They are the ordinary answer
+    to "any pain?" inside a care conversation, and treating them as an exit
+    would end almost every session on its first turn.
+    """
+    spoken = str(text or "").strip()
+    if not spoken:
+        return False
+    normalized = _STOP_PUNCT_RE.sub(" ", spoken).strip().lower()
+    if normalized in _STANDALONE_STOP:
+        return True
+    if _STOP_NEGATION_RE.search(spoken):
+        return False
+    return bool(_STOP_RE_EN.search(spoken) or _STOP_RE_HI.search(f" {spoken} "))
+
 # Grounded phrases that contradict reply_reason="none". The live model wrote
 # "remained in Pranamasana ... not yet attempting the Haske Stretch" in its
 # visual_observation, then praised the person and advanced anyway. These are
@@ -241,6 +315,27 @@ async def _fresh_visual_frame(session: dict) -> tuple[Optional[list], str]:
     return await asyncio.to_thread(capture)
 
 
+# How many turns from the ceiling the model is told to start closing. Landing
+# the ending itself is much better than having code cut the conversation off
+# mid-sentence; the hard limit is only there for when this is ignored.
+_WRAP_UP_MARGIN = 5
+
+
+def _wrap_up_notice(session: dict) -> str:
+    """A leading instruction to bring a long session to a close, or ""."""
+    remaining = session.get("turns_remaining")
+    if not isinstance(remaining, int) or remaining > _WRAP_UP_MARGIN:
+        return ""
+    if remaining <= 0:
+        return ("THIS SESSION IS OVER. It has reached its turn limit. Say a "
+                "short, warm closing line and set `session` to `complete`. Do "
+                "not start anything new.\n\n")
+    return (f"THIS SESSION HAS RUN LONG — about {remaining} turn(s) remain. "
+            "Bring it to a natural close now: finish what is in progress, say "
+            "a warm closing line, and set `session` to `complete`. Do not "
+            "begin a new activity.\n\n")
+
+
 def _prompt(session: dict, user_text: str, visual_status: str) -> str:
     # care_context was frozen when the event began. Re-sending that identical
     # prefix is required by a stateless API and is cheap on Cerebras prompt
@@ -249,7 +344,7 @@ def _prompt(session: dict, user_text: str, visual_status: str) -> str:
     context = session.get("care_context") or {}
     transcript = session.get("transcript") or []
     event = session.get("event") or {}
-    return f"""You are Kiki, currently conducting one live care session by voice.
+    return f"""{_wrap_up_notice(session)}You are Kiki, currently conducting one live care session by voice.
 You—not a script runner—own the interaction from beginning to end. Understand
 the complete hand-off and person context below, decide what matters now, and
 speak naturally. The person may answer unexpectedly, ask a side question,
@@ -438,7 +533,25 @@ async def run_care_voice_turn(user_text: str = "",
     directive = str((final or {}).get("session", "continue")).strip().lower()
     if directive not in {"continue", "complete", "cancelled", "declined"}:
         directive = "continue"
+
+    # --- Deterministic session end, underneath the model's wording -----------
+    # Both overrides exist because the model was previously the ONLY thing that
+    # could end a session, and the same prompt tells it to usually continue.
+    end_reason = ""
+    if directive == "continue" and user_asked_to_stop(user_text):
+        directive, end_reason = "cancelled", "person asked to stop"
+    if directive == "continue" and session.get("turn_limit_reached"):
+        directive, end_reason = (
+            "complete", f"turn limit reached ({session.get('turn_limit')})")
+    if end_reason:
+        print(f"[Care] Forcing session end: {end_reason}")
+
     _set_last_directive(final, bool(ok and spoken), spoken)
+    # A forced end must not leave main.py holding the microphone open waiting
+    # for an answer to a conversation that is over.
+    if end_reason:
+        _LAST_DIRECTIVE["expect_reply"] = False
+        _LAST_DIRECTIVE["hold_seconds"] = 0
 
     if ok and spoken:
         plan.record_care_turn(
@@ -446,10 +559,11 @@ async def run_care_voice_turn(user_text: str = "",
             visual_observation=visual_observation, tools_used=tools_used)
         if directive != "continue":
             status = "completed" if directive == "complete" else directive
-            plan.finish_care_session(status)
+            plan.finish_care_session(status, reason=end_reason)
             plan.add_care_log(
                 "care_session",
-                f"{session.get('event_title', 'Care session')} ended as {status}.")
+                f"{session.get('event_title', 'Care session')} ended as {status}"
+                + (f" ({end_reason})." if end_reason else "."))
         get_recorder().end_session(
             sid, status="done", result=spoken[:800], directive=directive,
             tools_used=tools_used, seconds=round(time.time() - started, 2))
@@ -466,6 +580,20 @@ async def run_care_voice_turn(user_text: str = "",
         visual_observation=visual_observation,
         note=f"Agent failure: {spoken[:500]}",
         tools_used=tools_used)
+    # A failing agent must not be able to trap the person in a session they
+    # asked to leave. The stop is theirs, not the model's, so it still applies
+    # on the path where the model produced nothing usable at all.
+    if end_reason:
+        try:
+            plan.finish_care_session(
+                "cancelled" if directive == "cancelled" else "completed",
+                reason=end_reason)
+            plan.add_care_log(
+                "care_session",
+                f"{session.get('event_title', 'Care session')} ended "
+                f"({end_reason}) despite a failed care turn.")
+        except Exception as exc:
+            print(f"[Care] could not close the session after a failure: {exc}")
     get_recorder().end_session(
         sid, status="failed", result=spoken[:800],
         seconds=round(time.time() - started, 2), owned_stop=owned_stop)

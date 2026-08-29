@@ -123,8 +123,11 @@ Caregiver PWA / senior voice request / Unified Idle Mind evidence
   success statement.
 - [ ] Prove restart recovery and exactly-once firing for a due event.
 - [ ] Prove overlapping due events queue/defer cleanly rather than being lost.
-- [ ] Prove a completed/cancelled/declined session clears `active_session`; the 19:07 session was
-  still persisted as active after eight turns, so completion cleanup is not locked.
+- [x] Prove a completed/cancelled/declined session clears `active_session`. Session ending is now
+  deterministic underneath the model: a spoken stop (`user_asked_to_stop`, EN+HI), a hard
+  `max_session_turns` ceiling, and the idle timeout each close it, and a finished session is stripped
+  of its frozen plan copy and archived to `session_history`. The live stuck "Surya Namaskar" session
+  was cleared through this path; the plan file went 43 kB -> 23 kB. **Real-Kiki retest still owed.**
 - [ ] Remove or migrate obsolete test routines and the old hydration event from the live care
   plan after Alex approves cleanup.
 - [ ] **Phase A locked on real Kiki.**
@@ -155,8 +158,9 @@ Caregiver PWA / senior voice request / Unified Idle Mind evidence
 - [ ] Review exercise safety behavior. The tested session suggested full circular neck rotations;
   guided exercise needs appropriate conservative safety constraints without turning the session
   into hardcoded dialogue.
-- [ ] Make session completion deterministic enough that a finished activity does not remain
-  indefinitely active or capture unrelated later conversation.
+- [x] Make session completion deterministic enough that a finished activity does not remain
+  indefinitely active or capture unrelated later conversation. Three closers, all under the model's
+  wording; a forced end also clears `expect_reply` and applies even when the care turn failed.
 - [ ] Confirm ordinary chat does not get trapped in care-agent routing after session completion.
 - [ ] Confirm a new due care event can start after the previous one completes.
 - [ ] Document the accepted real interaction in SIH test evidence.
@@ -438,7 +442,7 @@ deferred.
 | 2026-08-29 | runtime | 19:07 one-shot neck event | Fired once at 19:07:04; adaptive visual voice session ran for eight turns | Upcoming one-shot path accepted; session completion still open |
 | 2026-08-29 | `d0fe638` | Care reliability checkpoint | Current scheduler/session/claim fixes and tests checkpointed and pushed | Requires targeted real-device retest |
 | 2026-08-29 | `1b69ef0` | Mode capabilities + `health_sih` | Five `== "senior"` gates replaced by `mode_has_capability`; `health_sih` added; 11 new tests pass, suite 655 passed / 9 pre-existing failures unchanged | Phase H0 implemented; real-boot gate still required |
-| 2026-08-29 | pending | Environment provider (Phase G-lite) | Live Delhi read: 29.2C / feels 34.8C / 75% RH, PM2.5 120.6, PM10 338.1 -> CPCB 301 "very poor" (US AQI 376 for comparison). 33 new tests; suite 688 passed / 9 pre-existing failures unchanged | Weather+AQI implemented; snapshot injection and real-boot gate still required |
+| 2026-08-29 | `138fb13` | Environment provider (Phase G-lite) | Live Delhi read: 29.2C / feels 34.8C / 75% RH, PM2.5 120.6, PM10 338.1 -> CPCB 301 "very poor" (US AQI 376 for comparison). 33 new tests; suite 688 passed / 9 pre-existing failures unchanged | Weather+AQI implemented; snapshot injection and real-boot gate still required |
 
 ## Next exact gate
 

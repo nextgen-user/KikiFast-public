@@ -1979,6 +1979,29 @@ listening — it adds a caregiver **care plan** and family **email** on top.
   `main.py`'s normal foreground queue. They never call WorkerBrain or TTS. The daily-summary worker remains
   background work: it reads `care_log` and calls `send_care_email`. `schedule_receipt()` proves the exact
   item has an active worker and reports its next trigger in Asia/Kolkata.
+- **Session completion is deterministic** (2026-08-29). Ending a session used to depend ENTIRELY on
+  the care model emitting `session: "complete"`, while the same prompt tells it "usually it is
+  `continue`" — so the observed 19:07 neck session ran eight turns and stayed `active`, holding the
+  care lock against every other due routine and swallowing unrelated conversation until the 20-minute
+  idle timeout. Three deterministic closers now sit underneath the model's wording:
+  `user_asked_to_stop()` (a clear spoken stop in English or Hindi overrides `continue`), a hard
+  `senior_mode.care_agent.max_session_turns` ceiling (default 40, with the model asked to land the
+  ending itself 5 turns earlier via `_wrap_up_notice`), and the pre-existing idle timeout. A forced
+  end also clears `expect_reply`, so main.py does not hold the microphone open for a finished
+  conversation, and it applies even when the care turn itself failed — a broken agent must not trap
+  someone in a session they asked to leave. `user_asked_to_stop` matches single words only as a
+  COMPLETE utterance ("stop", "बस") and requires more evidence inside a sentence, because "I do not
+  want to stop" is the opposite instruction and "बसंत" contains "बस". "no"/"नहीं" are deliberately
+  never stops — they are the ordinary answer to "any pain?".
+- **A finished session drops its frozen plan copy.** `care_context` is a snapshot of the WHOLE care
+  plan, kept only so a stateless API can be re-sent an identical prefix mid-session; once the session
+  is over it is dead weight. Measured on the live plan, one finished session was 18 kB of a 43 kB
+  file and nothing ever removed it (clearing it took the file to 23 kB). `_close_session()` strips it
+  and appends a compact record to `session_history` (bounded 60) with status, end reason, turn count
+  and the last exchange — which is what the evening reflection reads via `session_history_since()`.
+  `_migrate` self-heals a plan written before this. `active_session` deliberately keeps holding the
+  finished record rather than becoming None: "how did the last session end" is a real question, and
+  `start_care_session` already treats any non-active status as unblocked.
 - **`care_voice_agent.py`** — owns one live microphone turn of the persistent session. It resends the frozen
   care-plan snapshot plus the real transcript to the configured Cerebras `gemma-4-31b`, exposes only relevant
   care tools, returns one exact voice-ready response, and separately marks the overall session as continue /
