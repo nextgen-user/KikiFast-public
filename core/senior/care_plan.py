@@ -16,6 +16,7 @@ Saves are atomic (tmp + ``os.replace``) so a crash mid-write never corrupts it.
 
 import json
 import os
+import statistics
 import threading
 import uuid
 from pathlib import Path
@@ -40,11 +41,11 @@ VALID_REMINDER_CATEGORIES = {
 VALID_SCHEDULE_KINDS = {"recurring", "daily", "once"}
 VALID_ROUTINE_CATEGORIES = {
     "morning", "medicine", "hydration", "meal", "exercise", "sleep",
-    "appointment", "wellbeing", "memory", "social", "safety", "other",
+    "appointment", "wellbeing", "memory", "social", "safety", "vitals", "other",
 }
 VALID_ROUTINE_ACTION_TYPES = {
     "speak", "check_in", "guided_step", "memory_activity", "play_music",
-    "observe", "log", "notify_caregiver",
+    "observe", "measure_vital", "log", "notify_caregiver",
 }
 
 
@@ -68,6 +69,7 @@ DEFAULT_STRUCTURE: Dict[str, Any] = {
     "approved_music": [],       # ["song / query", ...]
     "approved_topics": [],      # ["cricket", "old bollywood", ...]
     "care_log": [],             # {ts, kind, text}
+    "health_measurements": [], # trusted numeric readings for trend analysis
     "metadata": {"created": "", "last_updated": ""},
 }
 
@@ -278,14 +280,18 @@ class CarePlan:
         category = str(category or "other").strip().lower()
         if category not in VALID_ROUTINE_CATEGORIES:
             category = "other"
+        raw_schedule = schedule
         schedule = _normalize_schedule(schedule)
         if not _valid_schedule(schedule):
             raise ValueError(
-                "a valid routine schedule is required: daily HH:MM, recurring "
-                "positive seconds, or once ISO datetime")
-        actions = _normalize_routine_actions(actions)
+                "a valid routine schedule is required: "
+                '{"kind":"daily","value":"HH:MM"} or {"kind":"once","value":'
+                '"<ISO datetime>"} or {"kind":"recurring","value":<seconds>}. '
+                f"Received: {json.dumps(raw_schedule, ensure_ascii=False, default=str)[:200]}")
+        action_problems: List[str] = []
+        actions = _normalize_routine_actions(actions, action_problems)
         if not actions:
-            raise ValueError("a routine event requires at least one valid action")
+            raise ValueError(_no_valid_actions_error(action_problems))
         source = str(source or "user").strip().lower()
         evidence = str(evidence or "").strip()
         if not isinstance(continuous_vision, bool):
@@ -356,9 +362,11 @@ class CarePlan:
             if not _valid_schedule(fields["schedule"]):
                 raise ValueError("routine event schedule is invalid")
         if "actions" in fields:
-            fields["actions"] = _normalize_routine_actions(fields["actions"])
+            action_problems: List[str] = []
+            fields["actions"] = _normalize_routine_actions(
+                fields["actions"], action_problems)
             if not fields["actions"]:
-                raise ValueError("routine event requires at least one valid action")
+                raise ValueError(_no_valid_actions_error(action_problems))
         if "continuous_vision" in fields:
             if not isinstance(fields["continuous_vision"], bool):
                 raise ValueError("continuous_vision must be true or false")
@@ -597,6 +605,83 @@ class CarePlan:
             return [json.loads(json.dumps(e)) for e in self.data.get("care_log", [])
                     if e.get("ts", "") >= iso_ts]
 
+    def add_health_measurement(self, measurement: str, value: float, unit: str,
+                               quality: str, site: str = "", context: str = "",
+                               signal: Optional[Dict[str, Any]] = None,
+                               routine_event_id: str = "", session_id: str = ""
+                               ) -> Dict[str, Any]:
+        """Persist one trusted numeric vital reading for personal trends."""
+        measurement = str(measurement or "").strip().lower()
+        quality = str(quality or "").strip().upper()
+        if measurement != "heart_rate":
+            raise ValueError("unsupported health measurement")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("health measurement value must be numeric")
+        if not 20 <= value <= 250:
+            raise ValueError("heart-rate value is outside the sensor's supported range")
+        if quality not in {"GOOD", "FAIR"}:
+            raise ValueError("only trusted GOOD/FAIR readings may be trended")
+        entry = {
+            "id": uuid.uuid4().hex[:8],
+            "measured_at": datetime.now().astimezone().isoformat(),
+            "measurement": measurement,
+            "value": round(value, 1),
+            "unit": str(unit or "bpm").strip().lower(),
+            "quality": quality,
+            "site": str(site or "").strip().lower(),
+            "context": str(context or "").strip()[:500],
+            "signal": json.loads(json.dumps(signal or {})),
+            "routine_event_id": str(routine_event_id or "").strip(),
+            "session_id": str(session_id or "").strip(),
+        }
+        with self._lock:
+            values = self.data.setdefault("health_measurements", [])
+            values.append(entry)
+            if len(values) > 2000:
+                del values[:len(values) - 2000]
+        if not self.save():
+            raise IOError("could not persist health measurement")
+        return json.loads(json.dumps(entry))
+
+    def health_trend(self, measurement: str = "heart_rate", days: int = 7,
+                     limit: int = 30) -> Dict[str, Any]:
+        measurement = str(measurement or "heart_rate").strip().lower()
+        days = max(1, min(365, int(days or 7)))
+        limit = max(1, min(200, int(limit or 30)))
+        cutoff = datetime.now().astimezone().timestamp() - days * 86400
+        with self._lock:
+            rows = json.loads(json.dumps(self.data.get("health_measurements", [])))
+        trusted = []
+        for row in rows:
+            if row.get("measurement") != measurement:
+                continue
+            try:
+                if datetime.fromisoformat(row.get("measured_at", "")).timestamp() < cutoff:
+                    continue
+                trusted.append(row)
+            except (TypeError, ValueError):
+                continue
+        trusted.sort(key=lambda row: row.get("measured_at", ""))
+        values = [float(row["value"]) for row in trusted]
+        result: Dict[str, Any] = {
+            "measurement": measurement,
+            "period_days": days,
+            "count": len(values),
+            "recent": trusted[-limit:],
+        }
+        if values:
+            result.update({
+                "latest": values[-1],
+                "median": round(statistics.median(values), 1),
+                "minimum": round(min(values), 1),
+                "maximum": round(max(values), 1),
+                "change_from_median": round(values[-1] - statistics.median(values), 1),
+                "unit": trusted[-1].get("unit", "bpm"),
+            })
+        return result
+
     # -------------------------------------------------------------- internals
     def _edit_item(self, section: str, item_id: str, fields: Dict[str, Any]) -> bool:
         with self._lock:
@@ -648,63 +733,166 @@ def _valid_schedule(schedule: Any) -> bool:
     return False
 
 
+# The agent invents plausible key names for a schedule the same way it does for
+# actions. Live failures 2026-08-29: {"start_time":"12:39","trigger_type":
+# "scheduled_time"} was rejected four times at 00:37, and "daily 00:00" four
+# times at 00:08 — both unambiguous. Coerce the shape; `_valid_schedule` is
+# still the gate, so a genuinely ambiguous schedule is refused, not guessed.
+_SCHEDULE_KIND_KEYS = ("kind", "type", "trigger_type", "frequency",
+                       "recurrence", "mode")
+_SCHEDULE_VALUE_KEYS = ("value", "time", "start_time", "at", "when",
+                        "datetime", "date_time", "iso", "seconds",
+                        "interval_seconds", "interval")
+_SCHEDULE_KIND_ALIASES = {
+    "daily": "daily", "every_day": "daily", "everyday": "daily", "day": "daily",
+    "scheduled_time": "daily", "time_of_day": "daily", "time": "daily",
+    "once": "once", "one_time": "once", "onetime": "once", "single": "once",
+    "specific_date_time": "once", "date": "once", "datetime": "once",
+    "recurring": "recurring", "interval": "recurring", "repeat": "recurring",
+    "every": "recurring", "periodic": "recurring",
+}
+
+
+def _coerce_schedule_value(value: Any) -> tuple:
+    """Infer (kind, canonical_value) from the value alone, or (None, None)."""
+    if isinstance(value, bool):
+        return None, None
+    if isinstance(value, (int, float)):
+        seconds = int(value)
+        return ("recurring", seconds) if seconds > 0 else (None, None)
+    text = str(value or "").strip()
+    if not text:
+        return None, None
+    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I %p"):
+        try:
+            return "daily", datetime.strptime(text.upper(), fmt).strftime("%H:%M")
+        except ValueError:
+            pass
+    try:
+        datetime.fromisoformat(text)
+        return "once", text
+    except ValueError:
+        pass
+    if text.isdigit() and int(text) > 0:
+        return "recurring", int(text)
+    return None, None
+
+
 def _normalize_schedule(schedule: Any) -> Dict[str, Any]:
     """Best-effort coercion of a spoken/loose schedule into the canonical shape."""
-    if not isinstance(schedule, dict):
+    kind_hint, raw_value = "", None
+    if isinstance(schedule, dict):
+        kind_hint = _first_str(schedule, _SCHEDULE_KIND_KEYS).lower()
+        for key in _SCHEDULE_VALUE_KEYS:
+            if schedule.get(key) not in (None, ""):
+                raw_value = schedule[key]
+                break
+    elif isinstance(schedule, bool) or schedule is None:
         return {}
-    kind = str(schedule.get("kind", "")).strip().lower()
-    value = schedule.get("value")
-    if kind == "recurring":
-        if isinstance(value, bool):
-            return {}
-        try:
-            value = int(value)
-        except (TypeError, ValueError):
-            return {}
-    elif kind == "daily":
-        value = str(value or "").strip()
-        try:
-            value = datetime.strptime(value, "%H:%M").strftime("%H:%M")
-        except ValueError:
-            return {}
-    elif kind == "once":
-        value = str(value or "").strip()
-        try:
-            datetime.fromisoformat(value)
-        except ValueError:
-            return {}
+    elif isinstance(schedule, (str, int, float)):
+        # "daily 08:00" / "once 2026-08-29T12:39:00" / a bare time or interval.
+        head, _, tail = str(schedule).strip().partition(" ")
+        if tail.strip() and head.lower() in _SCHEDULE_KIND_ALIASES:
+            kind_hint, raw_value = head.lower(), tail.strip()
+        else:
+            raw_value = str(schedule).strip()
     else:
         return {}
-    return {"kind": kind, "value": value}
+
+    kind = _SCHEDULE_KIND_ALIASES.get(kind_hint, "")
+    inferred, value = _coerce_schedule_value(raw_value)
+    if value is None:
+        return {}
+    # A stated kind only wins when the value agrees with it; otherwise the value
+    # is the more reliable signal (models mislabel "once" far more often than
+    # they mistype an ISO timestamp).
+    if kind and kind == inferred:
+        return {"kind": kind, "value": value}
+    return {"kind": inferred, "value": value}
 
 
-def _normalize_routine_actions(actions: Any) -> List[Dict[str, Any]]:
+# The agent writes these actions from a natural-language request, so it reaches
+# for reasonable synonyms of the canonical keys. Live failure 2026-08-29
+# 00:41:20: a perfectly good "Back Exercise" routine was sent five times as
+# {"action": "guided_step", "data": "..."} — semantically exact, keyed wrong.
+# Every action was dropped, the error said only "requires at least one valid
+# action", and the agent reworded the prose it had right instead of the keys it
+# had wrong until the turn budget died. Accept the synonyms; a rename is not a
+# reason to lose a routine.
+_ACTION_TYPE_KEYS = ("type", "action", "action_type", "kind")
+_ACTION_TEXT_KEYS = ("instruction", "text", "question", "data", "content",
+                     "message", "prompt", "say", "value", "description")
+
+
+def _first_str(raw: Dict[str, Any], keys) -> str:
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _no_valid_actions_error(problems: List[str]) -> str:
+    """Build a rejection the agent can actually fix on its next turn."""
+    detail = "; ".join(problems[:6]) if problems else "no actions were supplied"
+    return (
+        "a routine event requires at least one valid action — " + detail +
+        '. Each action must be {"type": "speak|check_in|guided_step|'
+        'memory_activity|play_music|observe|measure_vital|log|notify_caregiver"'
+        ', "instruction": "<the words Kiki should say or do>", "needs_response":'
+        " true|false}. Fix the KEY NAMES; do not reword the instruction text.")
+
+
+def _normalize_routine_actions(
+        actions: Any, problems: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """Canonicalize routine actions, recording WHY any were rejected.
+
+    `problems` (when given) collects one human-readable reason per dropped
+    action. A validation error the model cannot act on is not validation — it
+    is a retry loop, so callers surface these back to the agent verbatim.
+    """
+    if problems is None:
+        problems = []
     if not isinstance(actions, list):
+        problems.append(
+            f"'actions' must be a JSON array, got {type(actions).__name__}")
         return []
     normalized = []
-    for raw in actions[:20]:
+    for index, raw in enumerate(actions[:20]):
         if not isinstance(raw, dict):
+            problems.append(f"action {index}: must be an object, got "
+                            f"{type(raw).__name__}")
             continue
-        action_type = str(raw.get("type", "speak")).strip().lower()
+        action_type = (_first_str(raw, _ACTION_TYPE_KEYS) or "speak").lower()
         if action_type not in VALID_ROUTINE_ACTION_TYPES:
+            problems.append(
+                f"action {index}: type {action_type!r} is not one of "
+                + "|".join(sorted(VALID_ROUTINE_ACTION_TYPES)))
             continue
-        instruction = str(
-            raw.get("instruction") or raw.get("text") or raw.get("question") or ""
-        ).strip()
+        instruction = _first_str(raw, _ACTION_TEXT_KEYS)
         steps = [str(step).strip() for step in (raw.get("steps") or [])
                  if str(step).strip()]
         if action_type == "guided_step" and not instruction and steps:
             instruction = steps[0]
         if not instruction:
+            problems.append(
+                f"action {index} ({action_type}): no instruction text. Put the "
+                f"words in \"instruction\". Keys received: "
+                + (", ".join(sorted(raw)) or "none"))
             continue
         normalized.append({
             "type": action_type,
             "instruction": instruction,
             "needs_response": bool(raw.get(
-                "needs_response", action_type in {"check_in", "guided_step"})),
+                "needs_response",
+                action_type in {"check_in", "guided_step", "measure_vital"})),
             "success_signal": str(raw.get("success_signal", "")).strip(),
             "on_concern": str(raw.get("on_concern", "")).strip(),
         })
+        if action_type == "measure_vital":
+            normalized[-1]["vital_type"] = str(
+                raw.get("vital_type") or "heart_rate").strip().lower()
     return normalized
 
 

@@ -109,6 +109,10 @@ KikiFast/
 │   │   ├── worker_engine.py    # Dataclasses: Worker, WorkerTrigger, WorkerCondition, enums
 │   │   ├── worker_brain.py     # execute_worker (builds prompt → run_agent_loop), face/vision buffers
 │   │   └── worker_manager.py   # Scheduler thread, persistence, lifecycle events, live-toggle reload listener
+│   ├── senior/
+│   │   ├── care_plan.py        # Whole-day adaptive routine/session + trusted health trend store
+│   │   ├── senior_care_manager.py # Care schedules → timing-only workers → complex care agent
+│   │   └── heart_rate.py       # Thread-safe structured MAX30102 controller; never generates speech
 │   ├── vision/
 │   │   ├── camera.py           # capture_photo_b64 from the MJPEG stream
 │   │   ├── vision_handler.py   # Periodic capture/QA logic, silent scene injection
@@ -667,11 +671,66 @@ about never letting a non-action sound like a completed one:
   detailed WhatsApp conversation about taco night and guacamole that did not exist).
 - `_is_meaningful` — a `"..."` summary is not a success.
 
-On failure or deadline the returned string explicitly tells the follow-up model **not** to
-claim success. The agent's `deadline_seconds` (22) sits below
-`llm.tool_calling.exec_timeout_overrides.complex_query` (26) so it reports partial progress
-itself rather than being truncated by main.py. `run_agent_loop`'s existing `progress_fn`
-drives the LCD/OLED line. Cloud-only — the local speaking slot is never touched.
+**The nudge has to name a tool the task actually has.** `min_tool_calls` used to reject a
+premature completion with one fixed sentence recommending `search_web`, appended verbatim
+every turn. Live failure 2026-08-28 23:35:35: "Did I drink water recently?" routed to care,
+the agent already had the answer from an injected `care_event`, called no tool, and got the
+same unusable nudge six times — it re-emitted byte-identical JSON each turn until the turn
+budget died and Kiki spoke *"That care action did not complete"*, discarding an answer it
+had. `run_agent_loop` now takes `verification_tools` (the agent passes its care or general
+menu) and `_force_tool_call` escalates: it names those tools, and on a verbatim repeat it
+says so and demands one specific call. A nudge the model cannot act on is not a guard, it
+is a deadlock.
+
+`allow_unverified_finish` then stops exhaustion from destroying a good answer: on the FINAL
+turn only, a completion with no tool call is returned with `unverified: True` instead of
+failing. It is opt-in and the agent enables it **only** for care requests that are
+plainly questions (`is_read_only_care_request`) with no active session — a stale answer to
+a question is recoverable, whereas a write reported without the write having happened is
+the taco-night failure again. Writes, guided session turns and `CARE_PLAN_DELEGATION` keep
+the hard failure.
+
+`is_care_request` was also narrowed for the same reason. Bare everyday nouns (`water`,
+`walk`, `lunch`, `sleep`, `routine`) now only mean care alongside a first-person reference,
+because matching them anywhere sent ordinary conversation down the care agent's
+direct-to-TTS path: "play a walking song" became a care request, and so did "what did they
+say about lunch?" — a WhatsApp question, i.e. exactly the request the fabrication guard
+exists for. Care-specific words (`medicine`, `caregiver`, `heart rate`, `दवाई`, `नब्ज़`, …)
+still match on their own.
+
+On failure or deadline the returned string explicitly forbids a false success. Ordinary
+agent work retains the 22-second internal deadline; a MAX30102 session receives a bounded
+75-second measurement deadline. Both sit below the speaking path's 85-second
+`complex_query` wait, so the agent reports its own outcome rather than being truncated by
+main.py. `run_agent_loop`'s existing `progress_fn` drives the LCD/OLED line. Cloud-only —
+the local speaking slot is never used for care reasoning.
+
+**Care result fast path:** a care `complex_query` final summary is already the exact
+voice-ready response. `main.py is_direct_care_complex_call()` therefore sends it directly
+to the existing `TTSStreamer` and skips `followup_llm_and_tts`. The synthetic assistant row
+did not come from llama.cpp, so `synthetic_tool_followup=true` forces a real prefix rewarm;
+marking it warm would violate §4. Ordinary tool results still use the local follow-up LLM.
+
+**A validation error the model cannot act on is a retry loop, not validation.**
+`care_plan.py` rejected semantically-perfect routine writes over key *names* and then
+refused to say which ones, so the agent reworded the prose it had right instead of the keys
+it had wrong until the turn budget died — the same audible "That care action did not
+complete". Three live loops on 2026-08-29 alone:
+- `00:41:20` — actions sent as `{"action": "guided_step", "data": "…"}` instead of
+  `{"type", "instruction"}`. `_normalize_routine_actions` read only the canonical keys, so
+  **every** action was dropped and the error said just "requires at least one valid action".
+  Five identical-in-substance retries.
+- `00:37:43` — `schedule: {"start_time": "12:39", "trigger_type": "scheduled_time"}`.
+- `00:08:26` — `schedule: "daily 00:00"`.
+
+Both normalizers now accept the synonym keys the model actually reaches for
+(`_ACTION_TYPE_KEYS`/`_ACTION_TEXT_KEYS`, `_SCHEDULE_KIND_KEYS`/`_SCHEDULE_VALUE_KEYS`/
+`_SCHEDULE_KIND_ALIASES`) and infer a schedule's kind from its value when the stated kind
+disagrees. Coercion is not guessing: `_valid_schedule` is still the gate, so
+`{"kind":"weekly","value":"monday"}` is refused. Every rejection now quotes what it
+received and names the keys it wanted — `_no_valid_actions_error` lists the offending
+action index, its keys, and the valid types, and ends "Fix the KEY NAMES; do not reword the
+instruction text."
 
 **Related fixes made for this feature:**
 - `whatsapp.py list_chats` selected `messages.content` without its JOIN when
@@ -1256,12 +1315,14 @@ recurring interval), `WorkerCondition` (person_seen / time_range / custom),
   VERBATIM, the last 2 entries kept whole, older middle entries squeezed to fit the budget.
 - `run_agent_loop(prompt, llm_fn, max_turns, label, stop_event, min_tool_calls,
   max_tool_calls, max_calls_per_turn, max_prompt_chars, max_tool_result_chars,
-  continue_guidance_fn)` @~230 — the engine shared
+  continue_guidance_fn, verification_tools, allow_unverified_finish)` @~230 — the engine shared
   by workers and Unified Idle Mind. JSON protocol: model replies either `{"tool_calls":[{tool,args}]}` or
   `{"status":"completed","summary",...,"speak":bool,"speak_text"}` or `{"status":"failed",...}`.
   Invalid JSON → the parse error is fed back for self-correction; `min_tool_calls` enforcement
   counts TOTAL executed calls (`total_tool_calls`, not unique tool names — 5 search_web calls
-  count as 5). **Hard tool-call budget** (stops runaway research loops — on cloud the model can
+  count as 5). All four `min_tool_calls` rejection sites go through `_force_tool_call`, which
+  names `verification_tools`, detects a verbatim repeat, and honours `allow_unverified_finish`
+  on the last turn (see §5.2c — a nudge naming the wrong tool deadlocked the care agent). **Hard tool-call budget** (stops runaway research loops — on cloud the model can
   batch a 20-call `tool_calls` array AND keep doing so turn after turn, so `max_turns` alone
   doesn't bound executed calls; one idle cycle fired 50+ searches): `max_calls_per_turn`
   (default 5) caps how many calls one turn executes (rest deferred to the next turn);
@@ -1745,6 +1806,53 @@ callback refuses to match a prompt file of any other width. `RN50x4.pt` is
 cached in `~/.cache/clip`, so generation needs no network; runtime matching is
 pure numpy and never imports torch.
 
+Confirmed events reach the model the same way face events do: a natural-language
+`[System: Kiki just saw this happen — ...]` line via `hot_inject`. It states the
+observation and stops — whether it is worth mentioning is the model's call, not
+something the injection preempts. Behind the
+`care_events` context source (so a roleplay mode suppresses it) and a rolling
+`max_injections_per_5min` cap. The cap is not optional — `unsteady` alone fired
+nine times in ten minutes during testing, and an uncapped injection would push
+the real conversation out of the window. Spoken events are *not* also injected:
+their `autonomous_vision` prompt already carries the description into history.
+
+A rejected candidate still donates its scene description. Gate 04 pays for a
+VLM look at the room on **every** candidate and most are rejected, so that
+description used to be discarded. It now goes through `_vision_history_inject`
+— the same injector `core/vision/vision_handler.py` uses — so it lands as
+`[WHAT KIKI SEES]: ...` with the existing turn-active guard, prefix rewarm and
+`vision` mode gate, rather than becoming a second kind of scene note. It also
+records into `get_vision_history()` so workers see it. Confirmed events are
+excluded (their care line already carries the description) and so is
+`NO PERSON`, and it runs on its own `max_scene_injections_per_5min` budget so a
+burst of rejections cannot crowd out real care observations.
+
+Speaking is a real turn, not a note. `_care_speak` in `main.py` queues
+`("autonomous_vision", prompt)` onto `stt_queue` — the same route the periodic
+spoken question uses, which appends the text and opens a turn immediately. An
+earlier version `hot_inject`ed an instruction instead; that only surfaces when
+the user next speaks, so a confirmed `heat_distress` sat silent while the WebUI
+reported it as `spoken`. Telemetry that overstates what happened is worse than a
+missing feature, especially in a pipeline whose whole purpose is not to claim
+things it has not verified.
+
+**Gate 04 judges the frame the event fired on**, shipped with the event as
+`image_b64` (960px, q88, ~55 KB — the same mechanism `unknown_face_enrolled`
+already uses). Capturing a fresh frame instead looked at the room **1-3 seconds
+later** (ZMQ hop + HTTP fetch + inter-frame sleep), by which time the cup was
+back on the table and the person had walked out of shot. Three true detections
+died that way in one session, one at similarity **0.86**. With the real frame in
+hand there is nothing to corroborate against — a later capture is a different
+moment, not a second opinion — so the two-frame agreement rule now applies only
+to the fallback path, where we are capturing live anyway and blur is the risk it
+was written for.
+
+**There is no person check in gate 04.** CLIP only produces a crop when its own
+detector already found someone, so re-testing here was never verification — it
+was a second, worse detector looking from further away in time. The prompt no
+longer mentions a person, `NO PERSON` is not a verdict, and absence of
+*evidence* is what rejects.
+
 Gate 04 never asks a leading question — "is she drinking?" invites a yes. It
 asks what the person is doing, open-ended, then tests whether that free answer
 *entails* the activity. `UNCLEAR` is first-class and counts as a rejection, two
@@ -1758,6 +1866,32 @@ Enabling this took `hailo_follower.service` from `--vision-mode none` to
 70 °C (from 58 °C), EXT5V steady at 5.08–5.22 V with no cut. It fits inside the
 headroom the CPU cap (§5.18h) bought, but it is not free — see §5.18g if the
 board starts dropping again.
+
+**The event set** (11 positives, 17 negatives). Beyond the original
+`drinking` / `eating` / `medicine` / `sleeping` / `heat_distress`:
+`exercising` (closes the loop on `care_plan.add_exercise` — a reminder becomes
+confirmed adherence), `wearing_mask` (the hook into the PS's air-quality
+alerts), `walking_aid`, `head_in_hands`, `wrapped_in_blanket`, and
+`slumped_forward`.
+
+`slumped_forward` is the hard one: working hunched over a laptop is visually
+near-identical, and a wrong "collapsed" reading is the most alarming false
+positive in the set. It gets three defences — a `leaning over a laptop or a
+desk to work` negative, a raised margin (0.13) so it must win clearly, and a
+`not` list in `_ENTAILMENT` that rejects the verdict outright if the vision
+model's own words mention a laptop, desk, keyboard or book.
+
+**`unsteady` was removed**, not tuned. `person holding a wall or furniture
+while standing` fired **9 times in 10 minutes** on a healthy person because it
+matched almost any standing pose near furniture — CLIP cannot separate
+*steadying yourself* from *being near a wall*. Its prompt is now a negative, so
+those crops are absorbed instead of firing, and `walking_aid` carries mobility
+with a far more distinctive silhouette. A detector that cries wolf that often
+is worse than no detector.
+
+Growing the set from 17 to 28 prompts spreads the softmax mass and lowers every
+winning score, so the default threshold came down 0.28 → 0.22. Expect this
+whenever prompts are added; `margin` is the real protector, not `threshold`.
 
 **Dropped from v1 deliberately:** `fall` and `chest_discomfort`. Both needed
 pose or a vitals signal; a CLIP-only fall detector that misfires trains the user
@@ -1840,6 +1974,16 @@ listening — it adds a caregiver **care plan** and family **email** on top.
   next trigger in Asia/Kolkata. During an active event with `continuous_vision=true`, `main.py` forces the
   existing Gemini capture/describe/inject pipeline after every conversational turn; completion/cancellation
   turns this session-scoped override off automatically.
+- **MAX30102 heart rate:** root `max30102_read.py` retains its CLI and also exposes structured
+  `prepare_heart_rate`/`capture_heart_rate` functions. `core/senior/heart_rate.py` serializes
+  access and exposes prepare/capture/cancel/status phases without any dialogue. The complex
+  agent dynamically guides sensor-clear, placement, stillness, retry and result steps through
+  `heart_rate_measurement`; only GOOD/FAIR quality BPM is atomically added to
+  `health_measurements` and seven-day personal trends. Poor attempts go only to `care_log`.
+  The MAX30102 SpO2 estimate remains uncalibrated and is never presented as a health reading.
+- **Timing-only routine workers:** a `senior:routine_event:*` worker bypasses generic
+  `WorkerBrain` and invokes the complex care agent once; its finished text goes directly to
+  `WorkerManager._speak_text`/TTS. The scheduler contributes no extra LLM pass.
 - **Agent ownership**: senior foreground care requests route to `complex_query`; direct `get_care_plan` and
   `update_care_plan` are intentionally absent from the speaking model's tool list. The care-specific complex
   agent reads first, corrects machine-format failures, writes an idempotent routine event, and verifies its

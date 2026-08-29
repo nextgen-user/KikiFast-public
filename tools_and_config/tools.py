@@ -1844,8 +1844,16 @@ async def get_care_plan(section: str = "") -> str:
                  "family_contact": "family_contacts", "routine": "routine_events",
                  "routine_event": "routine_events", "routines": "routine_events",
                  "day": "daily_routine", "daily_routine": "daily_routine",
-                 "care_session": "active_session", "session": "active_session"}
+                 "care_session": "active_session", "session": "active_session",
+                 "health": "health_trend", "heart_rate": "health_trend",
+                 "health_measurements": "health_measurements"}
         if not section:
+            heart_rate = plan.health_trend("heart_rate", days=7, limit=1)
+            heart_rate_summary = {
+                key: value for key, value in heart_rate.items() if key != "recent"}
+            if heart_rate.get("recent"):
+                heart_rate_summary["latest_measured_at"] = (
+                    heart_rate["recent"][-1].get("measured_at"))
             overview = {
                 "senior": plan.get_section("senior"),
                 "reminders": plan.get_section("reminders"),
@@ -1856,11 +1864,13 @@ async def get_care_plan(section: str = "") -> str:
                 "family_contacts": plan.get_section("family_contacts"),
                 "approved_music": plan.get_section("approved_music"),
                 "approved_topics": plan.get_section("approved_topics"),
+                "heart_rate_trend": heart_rate_summary,
             }
             return json.dumps(overview, ensure_ascii=False, indent=2)
         key = alias.get(section, section)
         value = (plan.care_session_state() if key == "active_session"
                  else plan.daily_routine() if key == "daily_routine"
+                 else plan.health_trend("heart_rate") if key == "health_trend"
                  else plan.get_section(key))
         if key == "care_log" and isinstance(value, list):
             value = value[-30:]  # only recent entries
@@ -1869,6 +1879,66 @@ async def get_care_plan(section: str = "") -> str:
         return json.dumps(value, ensure_ascii=False, indent=2)
     except Exception as e:
         return f"Error reading care plan: {e}"
+
+
+async def heart_rate_measurement(action: str, site: str = "finger",
+                                 seconds: Optional[float] = None,
+                                 context: str = "", days: int = 7) -> str:
+    """Operate the MAX30102 through structured phases; never emits dialogue."""
+    try:
+        from core.senior.care_plan import get_care_plan_store
+        from core.senior.heart_rate import get_heart_rate_controller
+
+        action = str(action or "").strip().lower()
+        action = {"start": "prepare", "measure": "capture",
+                  "read": "capture", "history": "trend"}.get(action, action)
+        if action not in {"prepare", "capture", "cancel", "status", "trend"}:
+            return json.dumps({
+                "status": "error", "reason": "invalid_action",
+                "allowed_actions": ["prepare", "capture", "cancel", "status", "trend"],
+            })
+        site = str(site or "finger").strip().lower()
+        if site not in {"finger", "wrist"}:
+            return json.dumps({"status": "error", "reason": "invalid_site",
+                               "allowed_sites": ["finger", "wrist"]})
+
+        plan = get_care_plan_store()
+        if action == "trend":
+            return json.dumps(plan.health_trend("heart_rate", days=days),
+                              ensure_ascii=False)
+        controller = get_heart_rate_controller()
+        if action == "status":
+            result = controller.state()
+        elif action == "cancel":
+            result = controller.cancel()
+        elif action == "prepare":
+            result = await asyncio.to_thread(controller.prepare, site)
+        else:
+            result = await asyncio.to_thread(controller.capture, seconds)
+            if result.get("status") == "trusted_reading":
+                session = plan.care_session_state()
+                entry = plan.add_health_measurement(
+                    measurement="heart_rate", value=result["bpm"],
+                    unit="bpm", quality=result.get("quality", "FAIR"),
+                    site=result.get("site", site), context=context,
+                    signal=result.get("signal", {}),
+                    routine_event_id=session.get("event_id", ""),
+                    session_id=session.get("id", ""))
+                result["record_id"] = entry["id"]
+                result["measured_at"] = entry["measured_at"]
+                result["trend"] = plan.health_trend("heart_rate", days=days, limit=7)
+                plan.add_care_log(
+                    "heart_rate", f"Trusted reading recorded: {result['bpm']} bpm "
+                    f"({result.get('quality')}, {result.get('site')}).")
+            elif result.get("status") not in {"cancelled", "cancel_requested"}:
+                plan.add_care_log(
+                    "heart_rate_attempt",
+                    "Heart-rate attempt was not recorded as a trusted reading: "
+                    + str(result.get("reason") or result.get("status")))
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except Exception as exc:
+        return json.dumps({"status": "error", "reason": "tool_failure",
+                           "detail": str(exc)[:300]}, ensure_ascii=False)
 
 
 async def get_care_schedule_status(item_id: str = "") -> str:
@@ -2877,7 +2947,7 @@ TOOLS = [
                 "properties": {
                     "section": {"type": "string", "description": "routine_event | care_session | reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"},
                     "action": {"type": "string", "description": "routine_event: add/edit/remove; care_session: start/advance/adapt/set_vision/complete/cancel/decline; others: add/edit/remove/set"},
-                    "data": {"type": "object", "description": "routine_event add: {title,objective,category,schedule:{kind,value},actions:[{type,instruction,needs_response,success_signal,on_concern}],continuous_vision:boolean,source,evidence,adaptation}. Actions are adaptable goals, not fixed dialogue. care_session adapt: {response,reason,remaining_actions:[...]}; changes only the live session unless routine_event is explicitly edited. Set continuous_vision=true only for guided events needing a fresh Gemini camera description after every turn. Preserve original language."}
+                    "data": {"type": "object", "description": "routine_event add: {title,objective,category,schedule:{kind,value},actions:[{type,instruction,needs_response,success_signal,on_concern,vital_type?}],continuous_vision:boolean,source,evidence,adaptation}. Actions are adaptable goals, not fixed dialogue. Action types include speak,check_in,guided_step,measure_vital,memory_activity,observe,log,notify_caregiver. For MAX30102 use category=vitals and {type:measure_vital,vital_type:heart_rate}. care_session adapt changes only the live session unless routine_event is explicitly edited. Preserve original language."}
                 },
                 "required": ["section", "action"]
             }
@@ -2891,7 +2961,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "section": {"type": "string", "description": "empty=overview | routine_event | care_session | reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"}
+                    "section": {"type": "string", "description": "empty=overview | routine_event | care_session | heart_rate | health_measurements | reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"}
                 },
                 "required": []
             }
@@ -2908,6 +2978,24 @@ TOOLS = [
                     "item_id": {"type": "string", "description": "Care-plan item id returned by update_care_plan; empty lists all active care workers"}
                 },
                 "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "heart_rate_measurement",
+            "description": "Care-agent-only MAX30102 measurement state machine. Use prepare after asking the person to uncover the sensor; after ready_for_contact, guide placement and stillness, then capture. Only trusted_reading is recorded/trended. The tool returns data and never speaks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["prepare", "capture", "cancel", "status", "trend"], "description": "Measurement phase"},
+                    "site": {"type": "string", "enum": ["finger", "wrist"], "description": "Sensor placement; finger is default"},
+                    "seconds": {"type": "number", "description": "Optional 10-60 second capture override; omit for validated preset"},
+                    "context": {"type": "string", "description": "Short factual context such as resting or recently walked; stored with a trusted reading"},
+                    "days": {"type": "integer", "description": "Trend window, 1-365 days"}
+                },
+                "required": ["action"]
             }
         }
     },
@@ -3158,6 +3246,7 @@ _ASYNC_TOOL_HANDLERS = {
     "update_care_plan": update_care_plan,
     "get_care_plan": get_care_plan,
     "get_care_schedule_status": get_care_schedule_status,
+    "heart_rate_measurement": heart_rate_measurement,
     "send_care_email": send_care_email,
     "alert_family": alert_family,
 }
@@ -3170,7 +3259,7 @@ _EXEC_TIMEOUT_DEFAULT = 30
 _EXEC_TIMEOUT_BY_TOOL = {
     # Must exceed action_agent.deadline_seconds so the agent's own deadline
     # wins and it can report what it managed to finish.
-    "complex_query": 30,
+    "complex_query": 90,
     "record_voice_note": 70,   # bounded by record_clip's own 60s cap
 }
 

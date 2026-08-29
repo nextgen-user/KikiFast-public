@@ -51,7 +51,7 @@ from tools_and_config.config_loader import get_llm_config, get_full_config
 from core.stt import STTEngine
 from core.llm import (stream_response, execute_tool_calls, warmup as llm_warmup,
                       register_history, hot_inject, last_turn_used_instant_vision,
-                      speaking_is_local)
+                      speaking_is_local, _extract_sentences)
 from core.tts import LCDOnlyStreamer, TTSStreamer, get_tts_system_prompt_note
 from core import local_llm
 from core.gesture_controls import (
@@ -236,6 +236,53 @@ def deterministic_care_plan_failure_reply(calls, tool_result):
         return ("माफ़ कीजिए, यह केयर प्लान में सेव नहीं हुआ। "
                 "कृपया समय और काम एक बार फिर बता दीजिए।")
     return None
+
+
+def is_direct_care_complex_call(calls, user_text=""):
+    """Care complex-agent results are already voice-ready; skip a second LLM."""
+    complex_calls = [call for call in (calls or [])
+                     if call.get("name") == "complex_query"]
+    if not complex_calls:
+        return False
+    try:
+        from core.brain.action_agent import is_care_request, _active_care_session
+        for call in complex_calls:
+            raw = call.get("arguments") or "{}"
+            try:
+                args = raw if isinstance(raw, dict) else json.loads(raw)
+            except Exception:
+                args = {}
+            if is_care_request(str(args.get("request", "")),
+                               str(args.get("context", ""))):
+                return True
+        return bool(is_care_request(str(user_text or "")) or _active_care_session())
+    except Exception:
+        return False
+
+
+def direct_complex_reply(calls, tool_result):
+    """Extract one complex agent's finished spoken answer from tool aggregation."""
+    calls = list(calls or [])
+    if len(calls) != 1 or calls[0].get("name") != "complex_query":
+        return ""
+    text = str(tool_result or "").strip()
+    prefix = "- complex_query:"
+    text = text[len(prefix):].strip() if text.startswith(prefix) else text
+    failure_marker = "CARE_ACTION_FAILED:"
+    return (text[len(failure_marker):].strip()
+            if text.startswith(failure_marker) else text)
+
+
+def queue_voice_ready_text(tts_streamer, text):
+    """Queue an already-authored reply sentencewise for synth-ahead/low TTFW."""
+    complete, tail = _extract_sentences(str(text or "").strip())
+    queued = 0
+    for sentence in complete + ([tail] if tail.strip() else []):
+        sentence = sentence.strip()
+        if sentence:
+            tts_streamer.add_sentence(sentence)
+            queued += 1
+    return queued
 
 
 _SUMMARY_KIND_PREFIX = {
@@ -1277,21 +1324,52 @@ async def main():
             _hot_inject(message_history, {"role": "system", "content": text})
 
         def _care_speak(activity, record):
-            # The speaking budget has already been checked. Injecting a direct
-            # instruction reuses the proven face-event path rather than opening
-            # a second route into the speaking loop.
-            _hot_inject(message_history, {
-                "role": "system",
-                "content": (f"[Care: {activity} confirmed — "
-                            f"{record.get('description', '')[:160]}. "
-                            f"Check in with them about this, briefly and warmly.]"),
-            })
+            """Actually start a turn, rather than leaving a note for the next one.
+
+            An earlier version hot_injected an instruction here. That only
+            reaches the model when the user next speaks, so a confirmed
+            heat_distress sat silent while the WebUI reported it as "spoken" --
+            worse than staying quiet, because the telemetry lied. Queuing
+            autonomous_vision is the same route the periodic spoken question
+            uses: main.py appends the text and opens a turn immediately.
+            """
+            prompt = (
+                f"You have just seen this yourself: "
+                f"{record.get('description', '')[:200]} "
+                f"That looks like {activity.replace('_', ' ')}. Check in with "
+                f"them about it right now — one short, warm question, no preamble."
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    stt_queue.put(("autonomous_vision", prompt)), loop)
+            except Exception as exc:
+                print(f"[Care] could not queue the proactive check-in: {exc}")
+
+        def _care_scene(description):
+            """Route a care-adjudication description into normal vision context.
+
+            Gate 04 pays for a VLM look at the room on every candidate, and most
+            candidates are rejected -- that description used to be discarded.
+            Reusing _vision_history_inject means it lands in exactly the format
+            and with exactly the guards the periodic vision path already uses
+            ([WHAT KIKI SEES]: ..., turn-safe, prefix-rewarmed, gated on the
+            'vision' source), rather than becoming a second kind of scene note.
+            """
+            context = f"{vision_handler.vision_prefix}{description}"
+            if not _vision_history_inject(context):
+                vision_handler.pending_vision_context = context
+            try:
+                from core.workers.worker_brain import get_vision_history
+                get_vision_history().record_vision(context)
+            except Exception:
+                pass
 
         care_events_consumer = HealthEventConsumer(
             config=_care_cfg,
             care_plan=_get_care_plan(),
             speak=_care_speak,
             inject=_care_inject,
+            see=_care_scene,
             host=_care_cfg.get("event_host", "127.0.0.1"),
             port=int(_care_cfg.get("event_port", 5556)),
         )
@@ -2013,6 +2091,7 @@ async def main():
                 raw_followup = ""   # verbatim tool-result follow-up text
                 tool_turn = False   # a <tool_call> fired and was answered this turn
                 synthetic_tool_followup = False  # deterministic failure reply, not box-generated
+                direct_care_turn = False  # complex care agent already authored speak_text
                 pending_neck = []
                 pending_tool_calls = None
                 followup_tool_calls = None  # a call emitted by a follow-up generation
@@ -2021,7 +2100,8 @@ async def main():
                 tool_result_data = None
 
                 def llm_and_tts():
-                    nonlocal full_response, raw_first, pending_neck, pending_tool_calls, tool_result_data
+                    nonlocal full_response, raw_first, pending_neck, pending_tool_calls
+                    nonlocal tool_result_data, direct_care_turn
                     first_sentence = True
                     try:
                         # abort_event: the IR push-to-talk barge-in kills this
@@ -2052,6 +2132,8 @@ async def main():
 
                             elif evt == "tool_calls":
                                 pending_tool_calls = data
+                                direct_care_turn = is_direct_care_complex_call(
+                                    data.get("calls", []), user_utterance)
                                 _tool_names = [c['name'] for c in data['calls']]
                                 print(f"[Tool] Model requested: {_tool_names}")
                                 # Futuristic gear/orbit animation while the
@@ -2164,7 +2246,8 @@ async def main():
                     its results in place of llm_and_tts. Tool calls recorded by
                     the spec are started HERE (never speculatively — tools have
                     side effects), mirroring llm_and_tts's tool block."""
-                    nonlocal full_response, raw_first, pending_neck, pending_tool_calls, tool_result_data
+                    nonlocal full_response, raw_first, pending_neck, pending_tool_calls
+                    nonlocal tool_result_data, direct_care_turn
                     # Abort-aware wait: an IR barge-in kills the (still running)
                     # speculative stream too — its abort_event closes the socket
                     # and _run's finally sets done, so this never hangs.
@@ -2178,6 +2261,8 @@ async def main():
                     pending_tool_calls = res["tool_calls"]
                     if pending_tool_calls:
                         data = pending_tool_calls
+                        direct_care_turn = is_direct_care_complex_call(
+                            data.get("calls", []), user_utterance)
                         _tool_names = [c['name'] for c in data['calls']]
                         print(f"[Tool] Model requested (speculative turn): {_tool_names}")
                         if _tool_names and _tool_names[0] != "play_music":
@@ -2301,7 +2386,8 @@ async def main():
                         # model actually spoke a lead-in (raw_first) — a silent
                         # tool call already gets a TOOL_FILLER above. Round 0
                         # only: a second bridge mid-answer sounds like a stutter.
-                        if (tool_round == 0 and TOOL_BRIDGE_ENABLED and TOOL_BRIDGES
+                        if (not direct_care_turn and tool_round == 0
+                                and TOOL_BRIDGE_ENABLED and TOOL_BRIDGES
                                 and raw_first.strip()):
                             bridge = random.choice(TOOL_BRIDGES)
                             print(f"[Tool] Bridging to answer: {bridge!r}")
@@ -2311,9 +2397,27 @@ async def main():
                         # to be turned into a false success by the model. Speak a
                         # deterministic truthful result; successful writes keep
                         # the normal in-character follow-up generation.
+                        direct_reply = (direct_complex_reply(
+                            pending_tool_calls.get("calls", []), tool_result)
+                            if direct_care_turn else "")
                         failure_reply = deterministic_care_plan_failure_reply(
                             pending_tool_calls.get("calls", []), tool_result)
-                        if failure_reply:
+                        if direct_reply:
+                            gestures = extract_neck_tags(direct_reply)
+                            if gestures:
+                                pending_neck.extend(gestures)
+                            spoken = strip_neck_tags(direct_reply)
+                            if spoken:
+                                queue_voice_ready_text(tts_streamer, spoken)
+                            full_response += " " + direct_reply
+                            raw_followup = direct_reply
+                            followup_tool_calls = None
+                            # The local box did not generate this assistant row;
+                            # register_history must perform a real rewarm.
+                            synthetic_tool_followup = True
+                            print("[Care] Direct complex-agent reply queued to TTS; "
+                                  "local follow-up LLM bypassed.")
+                        elif failure_reply:
                             tts_streamer.add_sentence(failure_reply)
                             full_response += " " + failure_reply
                             raw_followup = failure_reply

@@ -10,6 +10,7 @@ reading it does not trust. SpO2 is UNCALIBRATED -- see the closing note.
 """
 import argparse
 import sys
+import threading
 import time
 
 import numpy as np
@@ -240,10 +241,12 @@ def verdict(a, preset):
 
 # --- acquisition helpers ----------------------------------------------------
 
-def pump(sensor, seconds, red_sink=None, ir_sink=None):
+def pump(sensor, seconds, red_sink=None, ir_sink=None, cancel_event=None):
     """Drain the FIFO for `seconds`; return the mean IR over that window."""
     deadline, seen = time.time() + seconds, []
     while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         red, ir = sensor.read_fifo()
         if ir:
             seen.extend(ir)
@@ -254,10 +257,13 @@ def pump(sensor, seconds, red_sink=None, ir_sink=None):
     return float(np.mean(seen)) if seen else 0.0
 
 
-def wait_until(sensor, predicate, timeout, label):
+def wait_until(sensor, predicate, timeout, label, cancel_event=None,
+               progress=None, quiet=False):
     """Poll until predicate(mean_ir) holds for 0.5 s. Returns (ok, last_ir)."""
     start, held, last_print, level = time.time(), 0.0, 0.0, 0.0
     while time.time() - start < timeout:
+        if cancel_event is not None and cancel_event.is_set():
+            return False, level
         _, ir = sensor.read_fifo()
         if ir:
             level = float(np.mean(ir))
@@ -265,12 +271,191 @@ def wait_until(sensor, predicate, timeout, label):
             if elapsed - last_print >= 1.0:
                 last_print = elapsed
                 flag = "SAT" if level >= IR_SATURATED else ("ok" if predicate(level) else "..")
-                print(f"  {elapsed:4.1f}s  IR {level:8.0f}  {flag}   [{label}]", flush=True)
+                if not quiet:
+                    print(f"  {elapsed:4.1f}s  IR {level:8.0f}  {flag}   [{label}]", flush=True)
+                if progress is not None:
+                    progress({"phase": label, "elapsed_seconds": round(elapsed, 1),
+                              "ir_level": round(level), "signal": flag})
             held = held + 0.05 if predicate(level) else 0.0
             if held >= 0.5:
                 return True, level
         time.sleep(0.05)
     return False, level
+
+
+def preset_for(site="finger", seconds=None):
+    """Return an independent preset; library callers must never mutate globals."""
+    source = WRIST if str(site).strip().lower() == "wrist" else FINGER
+    preset = Preset(
+        source.site, source.led, source.contact_ir, source.clear_ir,
+        source.ir_low, source.ir_high, source.seconds, source.pi_min,
+        source.min_peaks)
+    if seconds is not None:
+        preset.seconds = max(10.0, min(60.0, float(seconds)))
+    return preset
+
+
+def _signal_payload(analysis, sensor, current):
+    keys = ("pi", "n_peaks", "rr_cv", "sdnn_ms", "bpm_spread",
+            "dc_ir", "dc_red")
+    signal = {}
+    for key in keys:
+        if key in analysis:
+            value = analysis[key]
+            signal[key] = round(float(value), 4) if isinstance(
+                value, (float, np.floating)) else int(value)
+    signal["i2c_glitches"] = int(sensor.glitches)
+    signal["led_current"] = int(current)
+    return signal
+
+
+def prepare_heart_rate(site="finger", clear_timeout=12.0, progress=None,
+                       cancel_event=None, bus_factory=SMBus):
+    """Quality-gated clear-sensor phase for voice/agent orchestration.
+
+    Returns JSON-serializable state. It never speaks and never prints procedural
+    guidance; the voice agent owns that interaction.
+    """
+    preset = preset_for(site)
+    cancel_event = cancel_event or threading.Event()
+    try:
+        with bus_factory(I2C_BUS) as bus:
+            sensor = MAX30102(bus)
+            part, rev = sensor.identify()
+            if part != PART_ID_MAX30102:
+                return {"status": "hardware_error", "reason": "unexpected_sensor",
+                        "part_id": part, "expected_part_id": PART_ID_MAX30102}
+            if not sensor.reset():
+                return {"status": "hardware_error", "reason": "reset_failed"}
+            sensor.configure()
+            time.sleep(0.2)
+            sensor.flush()
+            sensor.set_current(preset.led)
+            ok, level = wait_until(
+                sensor, lambda value: value < preset.clear_ir,
+                float(clear_timeout), "checking_clear_sensor",
+                cancel_event=cancel_event, progress=progress, quiet=True)
+            if cancel_event.is_set():
+                return {"status": "cancelled"}
+            if not ok:
+                return {"status": "retryable_failure",
+                        "reason": "sensor_not_clear_or_ambient_light",
+                        "ir_level": round(level)}
+            baseline = pump(sensor, 1.5, cancel_event=cancel_event)
+            if cancel_event.is_set():
+                return {"status": "cancelled"}
+            gate = max(preset.contact_ir, min(baseline * 2.0, 40_000))
+            return {
+                "status": "ready_for_contact",
+                "site": preset.site,
+                "ambient_baseline": round(baseline),
+                "contact_gate": round(gate),
+                "part_id": part,
+                "revision_id": rev,
+            }
+    except (OSError, IOError) as exc:
+        return {"status": "hardware_error", "reason": "i2c_error",
+                "detail": str(exc)[:200]}
+    except Exception as exc:
+        return {"status": "hardware_error", "reason": "unexpected_error",
+                "detail": str(exc)[:200]}
+
+
+def capture_heart_rate(preparation, seconds=None, contact_timeout=15.0,
+                       progress=None, cancel_event=None, bus_factory=SMBus):
+    """Detect contact, auto-gain, capture and return a trusted BPM or rejection."""
+    preparation = preparation if isinstance(preparation, dict) else {}
+    if preparation.get("status") != "ready_for_contact":
+        return {"status": "not_prepared", "reason": "run_prepare_first"}
+    preset = preset_for(preparation.get("site", "finger"), seconds)
+    cancel_event = cancel_event or threading.Event()
+    gate = float(preparation.get("contact_gate") or preset.contact_ir)
+    try:
+        with bus_factory(I2C_BUS) as bus:
+            sensor = MAX30102(bus)
+            part, _rev = sensor.identify()
+            if part != PART_ID_MAX30102:
+                return {"status": "hardware_error", "reason": "unexpected_sensor",
+                        "part_id": part, "expected_part_id": PART_ID_MAX30102}
+            if not sensor.reset():
+                return {"status": "hardware_error", "reason": "reset_failed"}
+            sensor.configure()
+            time.sleep(0.2)
+            sensor.flush()
+            current = sensor.set_current(preset.led)
+
+            ok, level = wait_until(
+                sensor, lambda value: value > gate, float(contact_timeout),
+                "checking_skin_contact", cancel_event=cancel_event,
+                progress=progress, quiet=True)
+            if cancel_event.is_set():
+                return {"status": "cancelled"}
+            if not ok:
+                return {"status": "retryable_failure", "reason": "no_contact",
+                        "site": preset.site, "ir_level": round(level)}
+
+            for _ in range(8):
+                level = pump(sensor, 0.7, cancel_event=cancel_event)
+                if cancel_event.is_set():
+                    return {"status": "cancelled"}
+                if level >= IR_SATURATED:
+                    nxt = max(0x08, int(current * 0.55))
+                elif level > preset.ir_high:
+                    nxt = max(0x08, int(current * 0.75))
+                elif level < preset.ir_low:
+                    nxt = min(0xFF, int(current * 1.7) + 4)
+                else:
+                    break
+                if nxt == current:
+                    break
+                current = sensor.set_current(nxt)
+                time.sleep(0.15)
+
+            pump(sensor, SETTLE_S, cancel_event=cancel_event)
+            sensor.flush()
+            red_all, ir_all = [], []
+            start, last_progress = time.time(), -5.0
+            while time.time() - start < preset.seconds:
+                if cancel_event.is_set():
+                    return {"status": "cancelled"}
+                red, ir = sensor.read_fifo()
+                if ir:
+                    red_all.extend(red)
+                    ir_all.extend(ir)
+                elapsed = time.time() - start
+                if progress is not None and elapsed - last_progress >= 3.0:
+                    last_progress = elapsed
+                    progress({"phase": "capturing", "elapsed_seconds": round(elapsed, 1),
+                              "duration_seconds": preset.seconds,
+                              "samples": len(ir_all)})
+                time.sleep(0.02)
+
+            count = len(ir_all)
+            if count < 300:
+                return {"status": "retryable_failure",
+                        "reason": "too_few_samples", "samples": count}
+            analysis = analyse(red_all, ir_all, count / preset.seconds)
+            quality, reasons = verdict(analysis, preset)
+            signal = _signal_payload(analysis, sensor, current)
+            if quality == "POOR" or "bpm" not in analysis:
+                return {"status": "retryable_poor_signal", "quality": quality,
+                        "site": preset.site, "reasons": reasons, "signal": signal}
+            return {
+                "status": "trusted_reading",
+                "measurement": "heart_rate",
+                "bpm": int(round(float(analysis["bpm"]))),
+                "unit": "bpm",
+                "quality": quality,
+                "site": preset.site,
+                "duration_seconds": preset.seconds,
+                "signal": signal,
+            }
+    except (OSError, IOError) as exc:
+        return {"status": "hardware_error", "reason": "i2c_error",
+                "detail": str(exc)[:200]}
+    except Exception as exc:
+        return {"status": "hardware_error", "reason": "unexpected_error",
+                "detail": str(exc)[:200]}
 
 
 def main():
@@ -281,9 +466,7 @@ def main():
     ap.add_argument("--led", type=lambda v: int(v, 0), help="starting LED current, e.g. 0x40")
     args = ap.parse_args()
 
-    preset = WRIST if args.wrist else FINGER
-    if args.seconds:
-        preset.seconds = args.seconds
+    preset = preset_for("wrist" if args.wrist else "finger", args.seconds)
     if args.led:
         preset.led = args.led
 

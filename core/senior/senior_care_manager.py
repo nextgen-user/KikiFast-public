@@ -28,6 +28,29 @@ _DAY_SECONDS = 86400
 _WORKER_PREFIX = "senior:"
 
 
+async def execute_scheduled_routine(worker) -> tuple[bool, str, Optional[str]]:
+    """Run a due routine through the sole care brain, then return direct TTS text."""
+    from core.brain.action_agent import run_complex_query
+
+    event_id = str(worker.name or "").rsplit(":", 1)[-1]
+    request = (
+        "CARE_PLAN_DELEGATION: A scheduled daily routine event is due now. "
+        f"Read event id {event_id}, start or idempotently resume its care_session, "
+        "and conduct the returned turn_actions adaptively. Produce the exact warm "
+        "voice-ready words Kiki should say now, then stop if a response is needed.")
+    result = str(await run_complex_query(request, context=worker.task_description))
+    # Only CARE_ACTION_FAILED carries voice-ready words after its marker. The
+    # generic markers are written FOR the speaking model ("Tell Alex it did
+    # not finish…"), so splitting them on the first colon would read a relay
+    # instruction out loud to the person the routine is caring for.
+    marker = "CARE_ACTION_FAILED:"
+    if result.startswith(marker):
+        return False, result, result[len(marker):].strip()
+    if result.startswith(("ACTION FAILED", "ACTION INCOMPLETE")):
+        return False, result, None
+    return True, result, result
+
+
 class SeniorCareManager:
     def __init__(self, worker_manager, care_plan, config: Optional[dict] = None):
         self.wm = worker_manager
