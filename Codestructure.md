@@ -1961,7 +1961,10 @@ listening — it adds a caregiver **care plan** and family **email** on top.
   `{"kind":"recurring","value":<sec>}` | `{"kind":"daily","value":"HH:MM"}` | `{"kind":"once","value":"<ISO>"}`.
 - **`senior_care_manager.py`** — `SeniorCareManager` bridges the care plan onto `WorkerManager`.
   `activate()` materializes one worker per enabled routine/reminder/exercise + a daily-summary worker;
-  `deactivate()` cancels every `senior:*` worker; `sync_workers()` rebuilds after a voice edit.
+  `deactivate()` deletes every `senior:*` worker (via `WorkerManager.remove_workers_by_prefix`, not
+  `cancel_worker` — cancelling left the rows in `workers.json`, so each care-plan edit accumulated
+  copies until five real events had become twenty-four workers); `sync_workers()` rebuilds after a
+  voice edit. `care_plan.json` itself is never touched, so the plan survives any number of mode switches.
   Daily schedules are recurring 86400s workers whose `last_fired_at` is back-dated so the first fire
   lands at HH:MM (§workers scheduler uses elapsed-since-last-fired). All routine/reminder/exercise workers
   are timing-only: they open persisted state and invoke a callback that places `care_session_start` on

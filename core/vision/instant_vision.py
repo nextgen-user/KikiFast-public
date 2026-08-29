@@ -238,18 +238,28 @@ def cap_normalized_messages(messages, max_ctx):
 def capture_best_frame_b64(cfg=None):
     """Grab the SHARPEST of a few FRESH camera snapshots as base64 JPEG.
 
-    The Hailo server's ``/clean`` endpoint returns the latest unannotated frame
-    over a short HTTP request.  Pulling snapshots is important here: OpenCV's
+    Sources, in order: the follower's pre-inference raw tap (``/raw``), its
+    un-annotated ``/clean`` frame, then the annotated Flask snapshot. Pulling
+    snapshots rather than reading a stream is important here: OpenCV's
     MJPEG/FFmpeg reader can block for 30 seconds per read while a pipeline is
-    restarting, which is catastrophic inside a spoken care turn.  We sample a
+    restarting, which is catastrophic inside a spoken care turn. We sample a
     handful of bounded requests and retain the frame with the highest Laplacian
-    variance.  The regular Flask snapshot is a bounded fallback when the clean
-    frame server is unavailable; neither path can build an MJPEG backlog.
+    variance; no path can build an MJPEG backlog.
+
+    Freshness is enforced, not assumed. A wedged Hailo pipeline keeps answering
+    200 with the last frame it ever saw, and on 2026-08-29 that had the care
+    agent praising a person's exercise form from a 13-minute-old still while
+    they were out of frame. The frame servers now report ``X-Frame-Age-Ms`` and
+    return 503 once a frame goes stale; anything older than ``max_frame_age_ms``
+    is discarded here as well, so a stalled camera reaches the caller as "no
+    frame" — which the care agent says out loud — rather than as stale pixels.
     """
     cfg = cfg if cfg is not None else _cfg()
     n = max(1, int(cfg.get("capture_frames", 4)))
     quality = int(cfg.get("jpeg_quality", 92))
     timeout = max(0.2, float(cfg.get("snapshot_timeout_seconds", 1.5)))
+    max_age_ms = float(cfg.get("max_frame_age_ms", 2000))
+    raw = str(cfg.get("raw_snapshot_url", "http://127.0.0.1:5002/raw"))
     primary = str(cfg.get(
         "clean_snapshot_url", "http://127.0.0.1:5001/clean"))
     fallback = str(cfg.get(
@@ -259,12 +269,29 @@ def capture_best_frame_b64(cfg=None):
     import numpy as np
 
     errors = []
-    for url, count in ((primary, n), (fallback, 1)):
-        best, best_sharp, shape = None, -1.0, None
+    for url, count in ((raw, n), (primary, n), (fallback, 1)):
+        best, best_sharp, shape, best_age = None, -1.0, None, None
         for _ in range(count):
             try:
                 response = requests.get(url, timeout=(timeout, timeout))
+                # 503 is the frame server explicitly saying "the pipeline has
+                # stalled". Treat it as no frame and move on to the next
+                # source rather than retrying a source that just told us it
+                # has nothing current.
+                if response.status_code == 503:
+                    errors.append(f"{url}: stale/no frame (503)")
+                    break
                 response.raise_for_status()
+                age_header = response.headers.get("X-Frame-Age-Ms")
+                age_ms = None
+                if age_header is not None:
+                    try:
+                        age_ms = float(age_header)
+                    except ValueError:
+                        age_ms = None
+                    if age_ms is not None and age_ms > max_age_ms:
+                        errors.append(f"{url}: frame {age_ms:.0f}ms old")
+                        break
                 frame = cv2.imdecode(
                     np.frombuffer(response.content, dtype=np.uint8),
                     cv2.IMREAD_COLOR)
@@ -274,6 +301,7 @@ def capture_best_frame_b64(cfg=None):
                 sharp = cv2.Laplacian(gray, cv2.CV_64F).var()
                 if sharp > best_sharp:
                     best_sharp, best, shape = sharp, frame, frame.shape
+                    best_age = age_ms
             except Exception as exc:
                 errors.append(f"{url}: {exc}")
         if best is None:
@@ -283,12 +311,13 @@ def capture_best_frame_b64(cfg=None):
         if not ok:
             errors.append(f"{url}: JPEG encode failed")
             continue
+        age_note = f", age={best_age:.0f}ms" if best_age is not None else ""
         print(f"[InstantVision] captured sharpest of {count} snapshots "
-              f"(focus={best_sharp:.0f}, {shape[1]}x{shape[0]})")
+              f"(focus={best_sharp:.0f}, {shape[1]}x{shape[0]}{age_note})")
         return base64.b64encode(buf.tobytes()).decode("utf-8")
 
     print("[InstantVision] snapshot capture failed ("
-          + "; ".join(errors[-2:])[:500] + ")")
+          + "; ".join(errors[-3:])[:500] + ")")
     return None
 
 

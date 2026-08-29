@@ -464,6 +464,11 @@ class CarePlan:
         return None
 
     def start_care_session(self, event_id: str) -> Dict[str, Any]:
+        # Clear a session nobody has spoken to before deciding this one is
+        # blocked. Without this the expiry is purely read-triggered: an idle
+        # house never calls care_session_state(), so a stale session lingers
+        # and every due routine is deferred behind it indefinitely.
+        self.expire_stale_care_session()
         with self._lock:
             event = self._session_event(event_id)
             if event is None:
@@ -580,7 +585,65 @@ class CarePlan:
             raise IOError("could not persist care-session completion")
         return self.care_session_state()
 
+    def _session_idle_timeout_seconds(self) -> float:
+        """How long an active session may go untouched before it is abandoned."""
+        try:
+            cfg = (get_full_config().get("senior_mode", {})
+                   .get("care_agent", {}) or {})
+            return float(cfg.get("session_idle_timeout_minutes", 20)) * 60.0
+        except Exception:
+            return 20 * 60.0
+
+    def expire_stale_care_session(self) -> bool:
+        """End an active session nobody has spoken to in a long time.
+
+        A session only ended when the model chose to emit
+        ``session: "complete"``. If it never did — the person walked away
+        mid-routine, or the turn failed — the session stayed active forever.
+        One "Hydration Reminder" session ran from 15:57 to 18:39 and did two
+        things it should not have: it made every other due care routine fail
+        with "another care session is already active" (retrying every 5 s for
+        hours), and because main.py routes *all* speech to the care agent
+        while a session is active, it swallowed unrelated conversation for
+        nearly three hours.
+
+        Returns True when a session was expired.
+        """
+        timeout = self._session_idle_timeout_seconds()
+        if timeout <= 0:
+            return False
+        with self._lock:
+            session = self.data.get("active_session")
+            if not isinstance(session, dict) or session.get("status") != "active":
+                return False
+            stamp = session.get("updated_at") or session.get("started_at")
+            try:
+                idle = (datetime.now()
+                        - datetime.fromisoformat(str(stamp))).total_seconds()
+            except (TypeError, ValueError):
+                return False
+            if idle < timeout:
+                return False
+            title = session.get("event_title", "Care session")
+            session["status"] = "abandoned"
+            session["updated_at"] = datetime.now().isoformat()
+            session["completed_at"] = datetime.now().isoformat()
+            session["abandoned_reason"] = (
+                f"no activity for {idle / 60:.0f} min (timeout "
+                f"{timeout / 60:.0f} min)")
+        self.add_care_log(
+            "care_session",
+            f"{title} ended as abandoned after {idle / 60:.0f} min of silence.")
+        self.save()
+        print(f"[CarePlan] Expired stale care session '{title}' "
+              f"(idle {idle / 60:.0f} min)")
+        return True
+
     def care_session_state(self) -> Dict[str, Any]:
+        # Checked on read so a stuck session heals itself wherever it is
+        # observed — the scheduler, the voice router, or the Web UI — instead
+        # of needing something to remember to sweep it.
+        self.expire_stale_care_session()
         with self._lock:
             session = json.loads(json.dumps(self.data.get("active_session")))
             if not isinstance(session, dict):

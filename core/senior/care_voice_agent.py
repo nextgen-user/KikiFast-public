@@ -29,6 +29,71 @@ def _cfg() -> Dict[str, Any]:
     return (get_full_config().get("senior_mode", {}).get("care_agent", {}) or {})
 
 
+def _exercise_cfg() -> Dict[str, Any]:
+    return (_cfg().get("guided_exercise", {}) or {})
+
+
+# What the turn that just spoke wants to happen next: how long to beep out a
+# hold, and whether an answer is actually needed. main.py reads this
+# immediately after awaiting run_care_voice_turn.
+#
+# Module state rather than a return value because the return type is the spoken
+# string that main.py and the existing tests both depend on. Care turns are
+# serialized by the single foreground turn lifecycle, so there is never a
+# second one in flight to race with this.
+_LAST_DIRECTIVE: Dict[str, Any] = {
+    "hold_seconds": 0, "expect_reply": True, "reply_reason": "none"}
+
+# Listening is the exception, and it has to be justified. Anything outside this
+# set is treated as "no reason given", which means keep leading the routine —
+# so a model that drifts back into conversational habits cannot stall the
+# session just by omitting or inventing a value.
+_REPLY_REASONS = {"aborted", "incorrect_form", "safety", "choice"}
+
+
+def get_last_care_directive() -> Dict[str, Any]:
+    """Hold/reply intent from the most recent care turn (a copy)."""
+    return dict(_LAST_DIRECTIVE)
+
+
+def _set_last_directive(final: Optional[dict], ok: bool,
+                        spoken: str = "") -> None:
+    from core.senior.exercise_cadence import clamp_hold_seconds
+
+    cfg = _exercise_cfg()
+    if not ok or not isinstance(final, dict):
+        # A failed turn must never leave the routine driving itself onward —
+        # fall back to simply listening.
+        _LAST_DIRECTIVE.update({
+            "hold_seconds": 0, "expect_reply": True, "reply_reason": "none"})
+        return
+
+    reason = str(final.get("reply_reason", "none") or "none").strip().lower()
+    if reason not in _REPLY_REASONS:
+        reason = "none"
+
+    # A reason to wait is only honoured if the person was actually asked
+    # something. Falling silent after a statement is how the routine used to
+    # stall: the person had nothing to answer and no idea they were expected to.
+    if reason != "none" and "?" not in str(spoken or ""):
+        print(f"[Care] reply_reason={reason} but no question was asked — "
+              f"continuing the routine instead of waiting in silence")
+        if reason in ("safety", "aborted"):
+            # Except when it might matter physically. Listen anyway; a missed
+            # "I feel dizzy" costs more than an awkward pause.
+            print("[Care] ...listening anyway: this reason concerns their safety")
+        else:
+            reason = "none"
+
+    _LAST_DIRECTIVE.update({
+        "hold_seconds": clamp_hold_seconds(
+            final.get("hold_seconds"),
+            int(cfg.get("max_hold_seconds", 120))),
+        "reply_reason": reason,
+        "expect_reply": reason != "none",
+    })
+
+
 def _tool_catalog() -> str:
     from tools_and_config.tools import TOOLS
 
@@ -58,25 +123,56 @@ def _execute_tool(name: str, args: dict) -> str:
     return execute_tool(name, args)
 
 
-async def _fresh_visual_frame(session: dict) -> tuple[Optional[str], str]:
-    """Capture one turn's fresh frame; Gemma itself interprets the pixels."""
+async def _fresh_visual_frame(session: dict) -> tuple[Optional[list], str]:
+    """Images for this turn; Gemma itself interprets the pixels.
+
+    Returns a LIST so a guided hold can hand over several frames from across
+    the movement rather than a single moment of it.
+    """
     cfg = _cfg()
     if not session.get("continuous_vision"):
         return None, "No fresh visual input was requested for this event."
     if not cfg.get("direct_image_input", True):
         return None, "Direct care-agent image input is disabled in config."
 
-    def capture() -> tuple[Optional[str], str]:
+    # Said whenever no image is attached. It has to be an explicit prohibition,
+    # not just an absence: with the camera pipeline wedged, a frozen frame had
+    # the model cheerfully confirming a person's exercise form while they were
+    # out of the room. A missing frame must produce "I can't see you", never a
+    # guess dressed up as an observation.
+    blind = (" NO image is attached to this request, so you cannot see the"
+             " person right now. Do not describe, judge, confirm, or praise"
+             " their posture, movement, or whether they did anything — you have"
+             " no visual evidence. Say plainly that you cannot see them at the"
+             " moment and ask them to tell you, or to move into view.")
+
+    # Frames taken WHILE the person was holding the last position. These beat a
+    # fresh capture for judging form: by the time the beeps stop and this turn
+    # runs, the position is already being released.
+    from core.senior.exercise_cadence import take_hold_frames
+    hold_frames = take_hold_frames()
+    if hold_frames:
+        return hold_frames, (
+            f"{len(hold_frames)} photographs taken DURING the hold you just "
+            f"counted out are attached, in time order. They show what the "
+            f"person actually did across the hold, not what they look like now "
+            f"that it has ended. Judge the movement and their form from these: "
+            f"whether the position was reached, held steady, and released — and "
+            f"say so only from what is visible.")
+
+    def capture() -> tuple[Optional[list], str]:
         try:
             from core.vision.instant_vision import capture_best_frame_b64
             image_b64 = capture_best_frame_b64()
             if not image_b64:
-                return None, "Visual feedback unavailable: camera returned no frame."
-            return image_b64, (
+                return None, ("Visual feedback unavailable: the camera returned"
+                              " no fresh frame." + blind)
+            return [image_b64], (
                 "A fresh camera frame is attached directly to this request. "
                 "Inspect the pixels yourself before choosing the spoken response.")
         except Exception as exc:
-            return None, f"Visual feedback unavailable: {str(exc)[:240]}"
+            return None, (f"Visual feedback unavailable: {str(exc)[:240]}"
+                          + blind)
 
     return await asyncio.to_thread(capture)
 
@@ -126,11 +222,69 @@ CURRENT PERSON SPEECH:
 AVAILABLE TOOLS:
 {_tool_catalog()}
 
+## LEADING AN EXERCISE (read this before answering during a physical routine)
+
+You are the instructor, not an interviewer. The person is moving; they should
+not have to talk to keep the routine going. Lead it.
+
+* Give ONE instruction, then set `hold_seconds` to how long they should hold or
+  keep moving. Kiki beeps once per second for exactly that long, so the timing
+  is real. NEVER count out loud in `summary` — writing "five, four, three, two,
+  one" makes TTS say it in two seconds and the person gets no actual time.
+  Write "hold it there" and put 5 in `hold_seconds`.
+* After the hold Kiki listens only briefly. If the person says nothing, you get
+  the next turn automatically with a fresh camera frame and
+  `[NO REPLY - CONTINUE THE ROUTINE YOURSELF]`. That is normal and expected —
+  silence means they are exercising. Do NOT ask "are you there?", do not repeat
+  the same instruction, and do not wait. Look at the frame and MOVE ON: the
+  other side, the next repetition, or the next exercise.
+* Use the frame to correct form, briefly and kindly, then keep going —
+  "a little slower, and now over to the left" — rather than stopping to
+  discuss it.
+* Encourage in passing, in the same breath as the next instruction. Do not send
+  a turn that is only praise, and do not ask permission between steps.
+
+### When to stop and listen
+
+Default to NOT listening. You stop the routine and wait for an answer only when
+the frame shows something you cannot resolve by carrying on, and you must name
+which in `reply_reason`:
+
+- `"aborted"` — they have stopped, walked off, sat down, or are clearly no
+  longer participating.
+- `"incorrect_form"` — they are attempting the movement but doing it wrong in a
+  way you already corrected once and they repeated, or wrongly enough that
+  continuing could hurt them.
+- `"safety"` — signs of pain, dizziness, breathlessness, unsteadiness.
+- `"choice"` — you genuinely need a decision (continue or finish, which side
+  hurts).
+- `"none"` — everything else. This is the common case. Keep leading.
+
+Someone silently doing the exercise correctly is `"none"`. Someone slightly
+imperfect on the first attempt is `"none"` — correct them in the next
+instruction and keep moving.
+
+**Whenever `reply_reason` is not `"none"`, `summary` MUST end with the actual
+question you want answered** — a specific one they can answer in a word:
+"Alex, kya aapko dard ho raha hai?" or "Should we stop here?" Never fall
+silent expecting them to guess, and never wait on a statement.
+
 Return exactly one JSON object.
 To use tools: {{"tool_calls":[{{"tool":"name","args":{{...}}}}]}}
 To speak now: {{"status":"completed","summary":"exact words Kiki will say",
 "session":"continue|complete|cancelled|declined",
+"hold_seconds":0,
+"reply_reason":"none|aborted|incorrect_form|safety|choice",
 "visual_observation":"brief third-person account of only what is visibly grounded, or empty when no image was attached"}}
+
+`hold_seconds` — seconds to beep out after speaking, while the person holds the
+position or keeps moving. 0 when there is nothing to time. Never counted aloud.
+During the hold Kiki takes several photographs and hands them all to you on the
+next turn, so you can see whether the position was actually held.
+
+`reply_reason` — why the routine should stop and wait, per the rules above.
+`"none"` keeps you leading. Anything else makes Kiki listen, and REQUIRES that
+`summary` ends with the question you want answered.
 
 `status=completed` means this MODEL TURN is ready for speech. The separate
 `session` field says whether the overall care session continues. Usually it is
@@ -154,7 +308,7 @@ async def run_care_voice_turn(user_text: str = "",
     if session.get("status") != "active":
         return "CARE_ACTION_FAILED: There is no active care session to continue."
 
-    image_b64, visual_status = await _fresh_visual_frame(session)
+    images_b64, visual_status = await _fresh_visual_frame(session)
     cfg = _cfg()
     deadline = float(cfg.get("turn_deadline_seconds", 90))
     owned_stop = stop_event is None
@@ -167,14 +321,14 @@ async def run_care_voice_turn(user_text: str = "",
         "care_voice", name=session.get("event_title", "care session"),
         model=fast_cloud.active_model(), event_id=session.get("event_id"),
         user_text=str(user_text)[:500], visual=visual_status[:1000],
-        image_attached=bool(image_b64))
+        image_attached=bool(images_b64), images=len(images_b64 or []))
 
     def llm_fn(prompt_text: str) -> str:
         if stop_event.is_set():
             return ""
         return fast_cloud.complete(
             prompt_text, provider="cerebras", stop_event=stop_event,
-            image_b64=image_b64,
+            image_b64=images_b64,
             image_mime=str(cfg.get("vision_mime_type", "image/jpeg")))
 
     def guidance(_total, _used):
@@ -206,15 +360,16 @@ async def run_care_voice_turn(user_text: str = "",
     spoken = str(result or "").strip()
     visual_observation = str(
         (final or {}).get("visual_observation") or "").strip()
-    if image_b64 and not visual_observation:
+    if images_b64 and not visual_observation:
         visual_observation = (
             "A fresh frame was supplied directly to Cerebras Gemma, but the "
             "model returned no separate visual-observation field.")
-    elif not image_b64:
+    elif not images_b64:
         visual_observation = visual_status
     directive = str((final or {}).get("session", "continue")).strip().lower()
     if directive not in {"continue", "complete", "cancelled", "declined"}:
         directive = "continue"
+    _set_last_directive(final, bool(ok and spoken), spoken)
 
     if ok and spoken:
         plan.record_care_turn(

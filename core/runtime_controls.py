@@ -179,6 +179,7 @@ _CONTEXT_SOURCES = (
     "face_events",  # greetings, "introduce yourself as Kiki", stranger names
     "idle_notes",   # Unified Idle Mind next-turn notes and proactive openers
     "peeping",      # passively overheard room audio
+    "care_events",  # confirmed CLIP care observations (drinking, eating, ...)
 )
 
 

@@ -520,6 +520,11 @@ async def main():
     summarizing = False
     turn_active = False  # a speaking turn is mid-flight (user msg appended, assistant not yet)
     turn_counter = 0
+    # Guided exercise: how many care turns in a row ran with no reply from the
+    # person. Bounded so a routine can lead itself through a set of movements
+    # without stalling, but can never become Kiki talking to an empty room
+    # indefinitely. Any real utterance resets it.
+    care_auto_continues = 0
     current_system_context = ""
     # Cooperative kill switch for the CURRENT speaking turn's LLM stream(s):
     # the IR push-to-talk barge-in sets it so generation stops the instant the
@@ -949,9 +954,15 @@ async def main():
         from core.senior.senior_care_manager import get_senior_care_manager
         senior_care_mgr = get_senior_care_manager(
             worker_manager, get_care_plan_store(), full_config.get("senior_mode", {}))
-        worker_manager.set_care_session_callback(
+        _queue_care_session = (
             lambda event_id: loop.call_soon_threadsafe(
                 stt_queue.put_nowait, ("care_session_start", event_id)))
+        worker_manager.set_care_session_callback(_queue_care_session)
+        # Same route for "start my exercise now" — the start_care_session tool
+        # opens the session, then hands the speaking turn to this lifecycle
+        # rather than voicing anything from the tool thread.
+        from core.senior.senior_care_manager import set_foreground_hook
+        set_foreground_hook(_queue_care_session)
         if get_active_mode() == "senior":
             senior_care_mgr.activate()
     except Exception as _senior_err:
@@ -1745,6 +1756,9 @@ async def main():
                 print(f"[User] {text}")
                 lcd_manager.display_stream("Question:", text)
                 collected_sentences.append(text)
+                # They spoke, so the routine is not running unattended: give the
+                # auto-continue budget back in full.
+                care_auto_continues = 0
 
                 if idle_mgr is not None:
                     if idle_mgr.is_thinking:
@@ -1758,7 +1772,8 @@ async def main():
                     open_listen_window()
 
             elif event in ("endpoint", "autonomous_vision", "face_wake",
-                           "meet_stranger", "care_session_start"):
+                           "meet_stranger", "care_session_start",
+                           "care_continue"):
                 # During peeping, ignore endpoints entirely (no AI response)
                 if peeping_active and event == "endpoint":
                     continue
@@ -1897,6 +1912,21 @@ async def main():
                     )
                     message_history.append({"role": "system", "content": instruction})
                     print(f"[Context] Injected meet-stranger name request for {temp_name}")
+                elif event == "care_continue":
+                    # The hold finished, the short reply window passed, and the
+                    # person said nothing — because they are exercising, not
+                    # chatting. Drive the routine on from the camera instead of
+                    # waiting to be spoken to.
+                    user_utterance = ""
+                    collected_sentences = []
+                    guided_care_turn = True
+                    message_history.append({
+                        "role": "system",
+                        "content": ("[CARE ROUTINE CONTINUES]: the person did not "
+                                    "reply during the listening window."),
+                    })
+                    print(f"[Care] Auto-continuing routine "
+                          f"(no reply; {care_auto_continues} consecutive)")
                 elif event == "care_session_start":
                     # The scheduler supplied timing and an event id, never a
                     # fake user utterance. This now follows the exact normal
@@ -2702,6 +2732,42 @@ async def main():
                     unmute_delay = agent_config.get("post_speech_unmute_delay_seconds", 0.35)
                     print(f"[Main] Speech ended. Waiting {unmute_delay}s before unmuting STT to ensure no loopback...")
                     await asyncio.sleep(unmute_delay)
+
+                    # --- Guided exercise: beat out the hold before listening ---
+                    # Still muted here, which is the point: the beeps are loud
+                    # and close to the microphone, and a countdown Kiki
+                    # transcribed as a reply would derail the routine.
+                    care_hold_ran = False
+                    if guided_care_turn:
+                        try:
+                            from core.senior.care_voice_agent import (
+                                get_last_care_directive, _exercise_cfg)
+                            _ex_cfg = _exercise_cfg()
+                            _directive = get_last_care_directive()
+                            _hold = int(_directive.get("hold_seconds", 0))
+                            if _hold > 0 and _ex_cfg.get("beep_countdown", True):
+                                lcd_manager.update_status("Hold", f"{_hold}s")
+                                from core.senior.exercise_cadence import play_countdown
+                                from core.vision.instant_vision import (
+                                    capture_best_frame_b64)
+                                # Photograph the position WHILE it is held. The
+                                # next turn judges form from these rather than
+                                # from a frame taken once the beeps stopped and
+                                # the person had already relaxed.
+                                _shots = (int(_ex_cfg.get("hold_captures", 3))
+                                          if _ex_cfg.get("capture_during_hold", True)
+                                          else 0)
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda: play_countdown(
+                                        _hold, turn_abort_event,
+                                        capture_fn=(capture_best_frame_b64
+                                                    if _shots else None),
+                                        max_captures=_shots))
+                                care_hold_ran = True
+                        except Exception as _hold_err:
+                            print(f"[Cadence] hold skipped: {_hold_err}")
+
                     # Clear any stale/late-arriving events in the queue before unmuting
                     while not stt_queue.empty():
                         try:
@@ -2714,6 +2780,61 @@ async def main():
                     stt.set_capture_mode("query")
                     stt.unmute()
                     open_listen_window()
+
+                    # --- Guided exercise: a short window, then carry on alone ---
+                    # An exercising person answers with their body, not their
+                    # voice. Waiting indefinitely for speech is what turned a
+                    # neck routine into a question-and-answer session where
+                    # every single step needed "okay" before it would advance.
+                    if guided_care_turn and not turn_abort_event.is_set():
+                        try:
+                            from core.senior.care_voice_agent import (
+                                get_last_care_directive, _exercise_cfg)
+                            _ex_cfg = _exercise_cfg()
+                            _directive = get_last_care_directive()
+                            _max_auto = int(_ex_cfg.get("max_auto_continues", 8))
+                            if (_ex_cfg.get("enabled", True)
+                                    and not _directive.get("expect_reply", True)
+                                    and care_auto_continues < _max_auto):
+                                _listen_s = float(
+                                    _ex_cfg.get("reply_listen_seconds", 3.5))
+
+                                async def _continue_if_silent(
+                                        listen_s=_listen_s,
+                                        after_hold=care_hold_ran):
+                                    """Give them a moment to speak; otherwise go on.
+
+                                    Anything the person says lands on stt_queue
+                                    (an interim heartbeat the instant the VAD
+                                    hears them, well before the transcript), so
+                                    a non-empty queue means "they are talking"
+                                    and this must not interrupt.
+                                    """
+                                    await asyncio.sleep(listen_s)
+                                    if not stt_queue.empty() or turn_active:
+                                        return
+                                    if not query_listening.is_set():
+                                        return          # window already closed
+                                    try:
+                                        from core.senior.care_plan import (
+                                            get_care_plan_store)
+                                        if (get_care_plan_store().care_session_state()
+                                                .get("status") != "active"):
+                                            return      # session ended meanwhile
+                                    except Exception:
+                                        return
+                                    stt_queue.put_nowait(("care_continue", ""))
+
+                                care_auto_continues += 1
+                                asyncio.create_task(_continue_if_silent())
+                                print(f"[Care] listening {_listen_s:.1f}s for a reply, "
+                                      f"then continuing on my own "
+                                      f"({care_auto_continues}/{_max_auto})")
+                            elif care_auto_continues >= _max_auto:
+                                print(f"[Care] auto-continue budget spent "
+                                      f"({_max_auto}); waiting for the person now.")
+                        except Exception as _cont_err:
+                            print(f"[Care] auto-continue skipped: {_cont_err}")
     except KeyboardInterrupt:
         pass
     finally:

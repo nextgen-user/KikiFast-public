@@ -1944,6 +1944,15 @@ async def heart_rate_measurement(action: str, site: str = "finger",
                            "detail": str(exc)[:300]}, ensure_ascii=False)
 
 
+async def start_care_session(routine: str = "") -> str:
+    """Begin a care routine right now rather than scheduling it for later."""
+    try:
+        from core.senior.senior_care_manager import start_care_session_now
+        return start_care_session_now(str(routine or "").strip())
+    except Exception as e:
+        return f"CARE_ACTION_FAILED: could not start the care session: {e}"
+
+
 async def get_care_schedule_status(item_id: str = "") -> str:
     """Return a verified worker receipt with the exact next trigger time."""
     try:
@@ -2973,6 +2982,20 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "start_care_session",
+            "description": "Start a care routine IMMEDIATELY (guided exercise, reminder) instead of scheduling it. Use when the person wants to do it now — 'let's do my neck exercise', 'start my exercise', 'chalo kasrat karte hain'. Do NOT use update_care_plan for this; that only schedules for later. Kiki takes over and guides the session itself, so say nothing about the steps yourself.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "routine": {"type": "string", "description": "Which routine: its care-plan id, or part of its title such as 'neck' or 'waist'. Omit only when the plan has exactly one routine."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_care_schedule_status",
             "description": "Care agent: verify that a care-plan event has an active worker and return its exact next_trigger_at receipt. Must be called after every scheduled care-plan add/edit before claiming success.",
             "parameters": {
@@ -3248,6 +3271,7 @@ _ASYNC_TOOL_HANDLERS = {
     # Senior citizen mode
     "update_care_plan": update_care_plan,
     "get_care_plan": get_care_plan,
+    "start_care_session": start_care_session,
     "get_care_schedule_status": get_care_schedule_status,
     "heart_rate_measurement": heart_rate_measurement,
     "send_care_email": send_care_email,

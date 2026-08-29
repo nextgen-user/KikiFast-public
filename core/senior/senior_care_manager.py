@@ -31,6 +31,7 @@ _WORKER_PREFIX = "senior:"
 async def execute_scheduled_routine(worker) -> tuple[bool, str, Optional[str]]:
     """Open a due session; main.py owns its first real voice turn."""
     from core.senior.care_plan import get_care_plan_store
+    from core.workers.worker_engine import WorkerDeferred
     event_id = str(worker.name or "").rsplit(":", 1)[-1]
     try:
         state = get_care_plan_store().start_care_session(event_id)
@@ -41,7 +42,94 @@ async def execute_scheduled_routine(worker) -> tuple[bool, str, Optional[str]]:
         # A worker never speaks or creates a fake participant response.
         return True, result, None
     except Exception as exc:
+        # Kiki is already mid-conversation with the person about another
+        # routine. That is a scheduling collision, not a broken worker: wait
+        # and try again rather than spending a retry and reporting a failure
+        # the person never needed to hear about.
+        if "another care session is already active" in str(exc):
+            raise WorkerDeferred(
+                f"care session {event_id} is waiting for the active session "
+                f"to finish") from exc
         return False, f"Could not start care session {event_id}: {exc}", None
+
+
+# Set by main.py at wiring time: hands an event id to the foreground voice
+# lifecycle so a care session opens and speaks on the NEXT turn. Same route the
+# scheduler uses — a session must never be spoken by a worker thread.
+_foreground_hook = None
+
+
+def set_foreground_hook(callback) -> None:
+    global _foreground_hook
+    _foreground_hook = callback
+
+
+def start_care_session_now(event_ref: str = "") -> str:
+    """Begin a care routine immediately instead of waiting for its schedule.
+
+    ``event_ref`` is a routine-event id, or part of its title ("neck", "waist").
+    With nothing at all, the single enabled routine is used when there is only
+    one, because "start my exercise" is unambiguous with one routine and
+    dangerous to guess at with five.
+    """
+    from core.senior.care_plan import get_care_plan_store
+
+    plan = get_care_plan_store()
+    events = [e for e in (plan.data.get("routine_events") or [])
+              if e.get("enabled", True)]
+    if not events:
+        return ("CARE_ACTION_FAILED: there are no enabled routines in the care "
+                "plan to start.")
+
+    ref = str(event_ref or "").strip().lower()
+    if not ref:
+        if len(events) != 1:
+            titles = ", ".join(str(e.get("title", "")) for e in events)
+            return (f"Which routine should I start? The care plan has: {titles}.")
+        match = events[0]
+    else:
+        match = next((e for e in events if str(e.get("id", "")).lower() == ref), None)
+        if match is None:
+            hits = [e for e in events
+                    if ref in str(e.get("title", "")).lower()
+                    or ref in str(e.get("objective", "")).lower()]
+            if not hits:
+                titles = ", ".join(str(e.get("title", "")) for e in events)
+                return (f"CARE_ACTION_FAILED: no care routine matches "
+                        f"{event_ref!r}. The plan has: {titles}.")
+            if len(hits) > 1:
+                titles = ", ".join(str(e.get("title", "")) for e in hits)
+                return f"Which one did you mean: {titles}?"
+            match = hits[0]
+
+    event_id = str(match.get("id", ""))
+    try:
+        state = plan.start_care_session(event_id)
+    except Exception as exc:
+        return f"CARE_ACTION_FAILED: could not start {match.get('title')}: {exc}"
+
+    if _foreground_hook is None:
+        # The session is open but nothing can voice it; say so rather than
+        # letting the person wait for a routine that will never speak.
+        plan.finish_care_session("cancelled")
+        return ("CARE_ACTION_FAILED: the foreground care route is not wired, so "
+                "the session was not started.")
+    try:
+        _foreground_hook(event_id)
+    except Exception as exc:
+        plan.finish_care_session("cancelled")
+        return f"CARE_ACTION_FAILED: could not open the care turn: {exc}"
+
+    print(f"[SeniorCare] Immediate session requested for "
+          f"{match.get('title')!r} ({event_id})")
+    return json.dumps({
+        "status": "care_session_starting",
+        "event_id": event_id,
+        "title": match.get("title", ""),
+        "session_id": state.get("id"),
+        "note": ("The session is open and Kiki will begin guiding it on this "
+                 "turn. Do not also describe the routine yourself."),
+    }, ensure_ascii=False)
 
 
 class SeniorCareManager:
@@ -154,10 +242,12 @@ class SeniorCareManager:
 
     # --------------------------------------------------------------- internal
     def _clear_existing(self) -> None:
+        # activate() rebuilds every care worker from the plan, so the old set
+        # is deleted outright rather than cancelled in place. Cancelling left
+        # the rows behind, and because each care-plan edit re-activates, they
+        # piled up — five real events had grown into twenty-four workers.
         try:
-            for w in self.wm.list_workers(include_completed=True):
-                if w.name.startswith(_WORKER_PREFIX) and w.is_active():
-                    self.wm.cancel_worker(w.id)
+            self.wm.remove_workers_by_prefix(_WORKER_PREFIX)
         except Exception as e:
             print(f"[SeniorCare] Clear existing failed: {e}")
 
