@@ -1,4 +1,9 @@
 **BEFORE ANY CHANGE YOU DO , FIRST COMMIT AND PUSH  THE CURRENT STATE with git add . , git commit and git push. THis will help in restoring code if you mess up.**
+# Senior-care roadmap
+
+The canonical phased implementation checklist, real-device lock gates, and current SIH senior-care
+status are maintained in `plan.md`. Read and update it whenever working on senior-care features.
+
 # KikiFast — Code Structure & Architecture Reference
 
 > Last updated: 2026-07-21. Line numbers refer to the files as of this date; they drift as
