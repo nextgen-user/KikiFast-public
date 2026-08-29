@@ -110,13 +110,14 @@ KikiFast/
 │   │   ├── worker_brain.py     # execute_worker (builds prompt → run_agent_loop), face/vision buffers
 │   │   └── worker_manager.py   # Scheduler thread, persistence, lifecycle events, live-toggle reload listener
 │   ├── senior/
-│   │   ├── care_plan.py        # Whole-day adaptive routine/session + trusted health trend store
-│   │   ├── senior_care_manager.py # Care schedules → timing-only workers → complex care agent
+│   │   ├── care_plan.py        # Whole-day session briefs + real transcript + trusted health trends
+│   │   ├── care_voice_agent.py # Persistent Cerebras care dialogue + fresh Gemini visual evidence
+│   │   ├── senior_care_manager.py # Care schedules → timing-only workers → foreground voice queue
 │   │   └── heart_rate.py       # Thread-safe structured MAX30102 controller; never generates speech
 │   ├── vision/
 │   │   ├── camera.py           # capture_photo_b64 from the MJPEG stream
 │   │   ├── vision_handler.py   # Periodic capture/QA logic, silent scene injection
-│   │   └── instant_vision.py   # Live-image questions → Groq multimodal Qwen (streamed), §5.2a
+│   │   └── instant_vision.py   # Bounded clean snapshots + live-image Groq Qwen path, §5.2a
 │   ├── cloud_budget.py         # Cost guard: rate limits + per-feature caps for paid cloud calls (§5.23)
 │   └── self_extend/
 │       ├── skill_manager.py    # Local SKILL.md skills (list/create/summarize)
@@ -711,26 +712,15 @@ to the existing `TTSStreamer` and skips `followup_llm_and_tts`. The synthetic as
 did not come from llama.cpp, so `synthetic_tool_followup=true` forces a real prefix rewarm;
 marking it warm would violate §4. Ordinary tool results still use the local follow-up LLM.
 
-**A validation error the model cannot act on is a retry loop, not validation.**
-`care_plan.py` rejected semantically-perfect routine writes over key *names* and then
-refused to say which ones, so the agent reworded the prose it had right instead of the keys
-it had wrong until the turn budget died — the same audible "That care action did not
-complete". Three live loops on 2026-08-29 alone:
-- `00:41:20` — actions sent as `{"action": "guided_step", "data": "…"}` instead of
-  `{"type", "instruction"}`. `_normalize_routine_actions` read only the canonical keys, so
-  **every** action was dropped and the error said just "requires at least one valid action".
-  Five identical-in-substance retries.
-- `00:37:43` — `schedule: {"start_time": "12:39", "trigger_type": "scheduled_time"}`.
-- `00:08:26` — `schedule: "daily 00:00"`.
-
-Both normalizers now accept the synonym keys the model actually reaches for
-(`_ACTION_TYPE_KEYS`/`_ACTION_TEXT_KEYS`, `_SCHEDULE_KIND_KEYS`/`_SCHEDULE_VALUE_KEYS`/
-`_SCHEDULE_KIND_ALIASES`) and infer a schedule's kind from its value when the stated kind
-disagrees. Coercion is not guessing: `_valid_schedule` is still the gate, so
-`{"kind":"weekly","value":"monday"}` is refused. Every rejection now quotes what it
-received and names the keys it wanted — `_no_valid_actions_error` lists the offending
-action index, its keys, and the valid types, and ends "Fix the KEY NAMES; do not reword the
-instruction text."
+**Care planning is not runtime scripting.** Older plans may still contain normalized
+`actions` records because the original agent used an action DSL and live failures showed
+that models vary key names (`action`/`data` versus `type`/`instruction`). Those normalizers
+remain for migration and WebUI compatibility, but new plans provide one substantive
+`session_brief`. The runtime never advances an action index. This removes the more serious
+failure mode: the scheduler executing several scripted assistant steps and accidentally
+creating/answering the participant side of the conversation. Schedule normalization stays
+strict (`daily`, `once`, `recurring`) and actionable validation errors still let the complex
+agent repair format mistakes before claiming that an event was saved.
 
 **Related fixes made for this feature:**
 - `whatsapp.py list_chats` selected `messages.content` without its JOIN when
@@ -1944,7 +1934,7 @@ full config editor. Curated controls cover Unified Idle Mind scheduling/tool bud
 active cloud limits, workers, summaries, vision, and routing.
 
 `CloudBudget` enforces global limits plus active categories
-(`idle_mind`, `vision`, `summary`, `reasoning`, and `face_enroll`). A cap of zero
+(`idle_mind`, `vision`, `care_vision`, `summary`, `reasoning`, and `face_enroll`). A cap of zero
 means unlimited. Unified Idle Mind reads its dedicated provider/model/fallback/thinking
 settings at process startup; restart after changing those values.
 
@@ -1956,24 +1946,37 @@ listening — it adds a caregiver **care plan** and family **email** on top.
 
 - **`care_plan.py`** — `CarePlan` over `care_plan.json` (gitignored; path from `senior_mode.care_plan_file`).
   Atomic tmp+`os.replace` saves, module singleton (`get_care_plan_store`). The canonical daily-plan unit is
-  `routine_events`: `{id,title,category,schedule,actions[],continuous_vision,source,evidence,adaptation}`.
-  Each event is an ordered goal/safety outline the voice AI conducts adaptively (`speak`, `check_in`, `guided_step`, `memory_activity`,
-  `play_music`, `observe`, `log`, `notify_caregiver`), not fixed dialogue or a reminder string. `active_session`
-  persists a session-local outline, current action batch, deviations, and replies across turns/restarts. The
-  agent can skip/repeat/replace remaining steps without changing future occurrences unless explicitly asked.
-  Legacy `reminders`/`exercises`, `senior`, contacts,
+  `routine_events`: `{id,title,category,schedule,session_brief,continuous_vision,source,evidence,adaptation}`.
+  `session_brief` is a rich natural-language handoff containing intended outcome and known context—not
+  fixed dialogue or an executable action queue. At session start, `active_session` freezes the complete
+  care-plan snapshot. It then records only real microphone speech, delivered assistant speech, tool use,
+  and grounded visual evidence in `transcript`; there is no action index and no generated user response.
+  The care model handles deviations naturally without rewriting future occurrences unless explicitly asked.
+  Legacy `actions`, `reminders`, and `exercises` remain readable; a due legacy item is adapted into the same
+  conversational foreground session rather than sent through WorkerBrain. `senior`, contacts,
   approved content and the rolling `care_log` (≤500) remain compatible. Schedule shape:
   `{"kind":"recurring","value":<sec>}` | `{"kind":"daily","value":"HH:MM"}` | `{"kind":"once","value":"<ISO>"}`.
 - **`senior_care_manager.py`** — `SeniorCareManager` bridges the care plan onto `WorkerManager`.
   `activate()` materializes one worker per enabled routine/reminder/exercise + a daily-summary worker;
   `deactivate()` cancels every `senior:*` worker; `sync_workers()` rebuilds after a voice edit.
   Daily schedules are recurring 86400s workers whose `last_fired_at` is back-dated so the first fire
-  lands at HH:MM (§workers scheduler uses elapsed-since-last-fired). Reminder/exercise workers speak via
-  the normal `execute_worker → _speak_text` path in Hindi; the daily-summary worker reads `care_log` and
-  calls `send_care_email`. `schedule_receipt()` proves the exact item has an active worker and reports its
-  next trigger in Asia/Kolkata. During an active event with `continuous_vision=true`, `main.py` forces the
-  existing Gemini capture/describe/inject pipeline after every conversational turn; completion/cancellation
-  turns this session-scoped override off automatically.
+  lands at HH:MM (§workers scheduler uses elapsed-since-last-fired). All routine/reminder/exercise workers
+  are timing-only: they open persisted state and invoke a callback that places `care_session_start` on
+  `main.py`'s normal foreground queue. They never call WorkerBrain or TTS. The daily-summary worker remains
+  background work: it reads `care_log` and calls `send_care_email`. `schedule_receipt()` proves the exact
+  item has an active worker and reports its next trigger in Asia/Kolkata.
+- **`care_voice_agent.py`** — owns one live microphone turn of the persistent session. It resends the frozen
+  care-plan snapshot plus the real transcript to the configured Cerebras `gemma-4-31b`, exposes only relevant
+  care tools, returns one exact voice-ready response, and separately marks the overall session as continue /
+  complete / cancelled / declined. It never simulates the next participant turn and has no exercise,
+  medicine, or wellbeing dialogue templates. If important context is missing, the model asks naturally;
+  care-plan formulation likewise reasons about context sufficiency rather than running a fixed questionnaire.
+- **Continuous care vision:** when the event/session switch is on, each care turn first pulls four bounded
+  unannotated snapshots from Hailo `http://127.0.0.1:5001/clean`, selects the sharpest, and sends that frame
+  to Vertex Gemini for a grounded observation. Cerebras currently accepts text chat rather than image input,
+  so the observation—not a second generated care reply—is appended to the same Gemma care conversation.
+  Snapshot pulls replace OpenCV MJPEG reads, which measured two 30-second stalls during a pipeline restart.
+  Ending/cancelling ends the session-scoped override; voice can also set it on/off for the current session.
 - **MAX30102 heart rate:** root `max30102_read.py` retains its CLI and also exposes structured
   `prepare_heart_rate`/`capture_heart_rate` functions. `core/senior/heart_rate.py` serializes
   access and exposes prepare/capture/cancel/status phases without any dialogue. The complex
@@ -1981,9 +1984,11 @@ listening — it adds a caregiver **care plan** and family **email** on top.
   `heart_rate_measurement`; only GOOD/FAIR quality BPM is atomically added to
   `health_measurements` and seven-day personal trends. Poor attempts go only to `care_log`.
   The MAX30102 SpO2 estimate remains uncalibrated and is never presented as a health reading.
-- **Timing-only routine workers:** a `senior:routine_event:*` worker bypasses generic
-  `WorkerBrain` and invokes the complex care agent once; its finished text goes directly to
-  `WorkerManager._speak_text`/TTS. The scheduler contributes no extra LLM pass.
+- **Foreground ownership / anti-feedback loop:** due `senior:routine_event:*`, `senior:reminder:*`, and
+  `senior:exercise:*` workers bypass generic `WorkerBrain` and queue `main.py`. The existing turn lifecycle
+  sets `turn_active`, mutes STT, pauses wake-word recognition, gets one care-model reply, queues it directly
+  to TTS, waits for playback, and only then reopens the microphone. Thus the scheduler contributes no LLM
+  pass and Kiki cannot transcribe its own care prompt as the person's answer.
 - **Agent ownership**: senior foreground care requests route to `complex_query`; direct `get_care_plan` and
   `update_care_plan` are intentionally absent from the speaking model's tool list. The care-specific complex
   agent reads first, corrects machine-format failures, writes an idempotent routine event, and verifies its
@@ -2002,8 +2007,9 @@ listening — it adds a caregiver **care plan** and family **email** on top.
 - **Per-mode `main_tools`**: `core/llm.py _effective_main_tools()` honors an optional
   `assistant_modes.modes.<mode>.main_tools` override (senior adds `complex_query` and emergency tools), else the global
   `llm.main_tools`. Cache-safe — a mode switch already replaces msg[0] and re-warms (§4).
-- **Wiring** (`main.py`): the manager singleton is built right after `worker_manager.start_scheduler()`
-  (activates if `active_on_startup == "senior"`), and `sync_mode_prompt` (the cache-safe mode boundary)
+- **Wiring** (`main.py`): the manager singleton and foreground callback are registered before
+  `worker_manager.start_scheduler()` (so even an immediately-due event cannot fall through to worker speech),
+  activates if `active_on_startup == "senior"`, and `sync_mode_prompt` (the cache-safe mode boundary)
   activates/deactivates on mode change. Boot straight into it via `assistant_modes.active_on_startup:
   "senior"`, or say "switch to senior citizen mode".
 
@@ -2017,6 +2023,7 @@ listening — it adds a caregiver **care plan** and family **email** on top.
 | `llm` | Foreground speaking provider/model, local endpoint, tools, prompt, and cache controls. |
 | `idle_mind` | The only background cognition configuration: provider/model/fallback/thinking level, state/journal paths, scheduling limits, and tool budgets. |
 | `action_agent` | The `complex_query` multi-step agent (§5.2c): provider (`cerebras` default / `groq` fallback), per-provider model and context caps, turn/tool budgets, and the wall-clock deadline. Cloud-only; never uses the local slot. |
+| `senior_mode.care_agent` | Foreground guided-care limits plus Gemini vision primary/fallback. Conversation generation reuses the latency-critical Cerebras/Gemma `action_agent` provider. |
 | `always_listen_config` | Capture-only buffer path and transcript size limits. |
 | `cloud_limits` | Global and active-category caps; `idle_mind` has its own row. Zero means unlimited. |
 | `knowledge_base` | Durable-memory path and startup context limits. |

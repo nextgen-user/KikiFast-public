@@ -6,10 +6,10 @@ a real background *worker* (§5.13), plus a daily caregiver-summary worker.
 Leaving the mode cancels them. Schedule edits re-sync immediately; progress
 inside an active multi-turn session deliberately does not rebuild its worker.
 
-Nothing here re-implements scheduling or speaking — it drives
-``WorkerManager.create_worker`` and lets the normal worker path speak the
-reminder aloud (``execute_worker`` → ``_speak_text`` → ``TTSStreamer``) under
-the usual single-slot preempt/rewarm discipline.
+Nothing here re-implements scheduling or speaking. It drives
+``WorkerManager.create_worker``; when any care item becomes due, the worker only
+opens persisted session state and queues ``main.py``. The foreground microphone
+lifecycle and conversational care agent own every spoken turn.
 
 Schedule mapping:
   recurring {value=<sec>}  -> recurring worker, first fire <sec> from now
@@ -29,26 +29,19 @@ _WORKER_PREFIX = "senior:"
 
 
 async def execute_scheduled_routine(worker) -> tuple[bool, str, Optional[str]]:
-    """Run a due routine through the sole care brain, then return direct TTS text."""
-    from core.brain.action_agent import run_complex_query
-
+    """Open a due session; main.py owns its first real voice turn."""
+    from core.senior.care_plan import get_care_plan_store
     event_id = str(worker.name or "").rsplit(":", 1)[-1]
-    request = (
-        "CARE_PLAN_DELEGATION: A scheduled daily routine event is due now. "
-        f"Read event id {event_id}, start or idempotently resume its care_session, "
-        "and conduct the returned turn_actions adaptively. Produce the exact warm "
-        "voice-ready words Kiki should say now, then stop if a response is needed.")
-    result = str(await run_complex_query(request, context=worker.task_description))
-    # Only CARE_ACTION_FAILED carries voice-ready words after its marker. The
-    # generic markers are written FOR the speaking model ("Tell Alex it did
-    # not finish…"), so splitting them on the first colon would read a relay
-    # instruction out loud to the person the routine is caring for.
-    marker = "CARE_ACTION_FAILED:"
-    if result.startswith(marker):
-        return False, result, result[len(marker):].strip()
-    if result.startswith(("ACTION FAILED", "ACTION INCOMPLETE")):
-        return False, result, None
-    return True, result, result
+    try:
+        state = get_care_plan_store().start_care_session(event_id)
+        result = json.dumps({
+            "status": "care_session_ready", "event_id": event_id,
+            "session_id": state.get("id"),
+        }, ensure_ascii=False, separators=(",", ":"))
+        # A worker never speaks or creates a fake participant response.
+        return True, result, None
+    except Exception as exc:
+        return False, f"Could not start care session {event_id}: {exc}", None
 
 
 class SeniorCareManager:
@@ -229,54 +222,13 @@ class SeniorCareManager:
 
     # ----------------------------------------------------------- task prompts
     def _task_for(self, item: dict) -> str:
-        lang = self.plan.language()
-        lang_note = ("Speak in natural, clear Hindi (Devanagari)."
-                     if lang == "hi" else "Speak in simple, clear English.")
-        if item.get("_kind") == "routine_event":
-            actions = item.get("actions", [])
-            interactive = any(action.get("needs_response") for action in actions)
-            action_json = json.dumps(actions, ensure_ascii=False)
-            session_rule = (
-                f"First call update_care_plan(section='care_session', action='start', "
-                f"data={{'event_id':'{item.get('id', '')}'}}). Read the returned turn_actions, "
-                "conduct ALL of them in order, then stop at the response-required action so "
-                "the person can answer. The foreground "
-                "care agent will continue the persisted session on their next turn."
-                if interactive else
-                "Carry out the actions in order now. Use tools for tool actions, combine the "
-                "spoken actions into one warm concise interaction, and add a care_log entry."
-            )
-            return (
-                f"A daily care-routine event is due: '{item.get('title', '')}' "
-                f"(event id {item.get('id', '')}, category {item.get('category', 'other')}). "
-                f"{lang_note} This is an ordered care sequence, not a generic reminder. "
-                f"Actions JSON: {action_json}. Continuous per-turn vision feedback is "
-                f"{'enabled' if item.get('continuous_vision') else 'disabled'} for this event. "
-                f"{session_rule} The actions are an adaptable goal outline, not fixed dialogue: "
-                "the voice AI must phrase them naturally and accept skip/repeat/slower/change/stop "
-                "requests. Adapt warmly to the person's response and never claim an action was "
-                "completed if it was not. Respond ONLY "
-                "with final JSON status, speak=true, and the exact speak_text to say now."
-            )
-        if item.get("_kind") == "exercise":
-            steps = " | ".join(item.get("steps", []))
-            return (
-                f"It is time for the guided exercise '{item.get('name','')}' "
-                f"prescribed by {item.get('prescribed_by') or 'the caregiver'}. "
-                f"{lang_note} Gently and warmly lead the senior through these steps one at a "
-                f"time, encouraging them and pausing between steps: {steps}. "
-                "Respond ONLY with final JSON: status 'completed', speak=true, and speak_text "
-                "containing your warm spoken guidance. After delivering, if the senior clearly "
-                "declined or seemed unwell, call update_care_plan to add a care_log note."
-            )
-        # reminder
+        label = (item.get("title") or item.get("name") or item.get("message")
+                 or "scheduled care item")
         return (
-            f"It is time for a {item.get('category','')} reminder for the senior. "
-            f"{lang_note} Warmly and briefly remind them: \"{item.get('message','')}\". "
-            "Sound caring, not robotic; add a light friendly touch. Respond ONLY with final "
-            "JSON: status 'completed', speak=true, speak_text containing the spoken reminder. "
-            "Then call update_care_plan with section 'care_log' action 'add' to record that "
-            "you delivered this reminder (and the senior's response if you heard one)."
+            f"Scheduled foreground care-session trigger for {item.get('_kind', 'care')} "
+            f"id {item.get('id', '')}, titled '{label}'. The worker only opens "
+            "persisted session state and queues the normal voice loop. It must not "
+            "generate dialogue, task instructions, or simulate the person."
         )
 
     def _daily_summary_task(self, contacts: List[dict]) -> str:

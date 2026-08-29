@@ -940,7 +940,6 @@ async def main():
 
     # --- Workers System ---
     worker_manager = get_worker_manager(loop, message_history=message_history)
-    worker_manager.start_scheduler()
 
     # --- Senior Citizen Mode: bridge the care plan onto the workers scheduler ---
     # Additive: only does anything while the 'senior' assistant mode is active.
@@ -950,10 +949,17 @@ async def main():
         from core.senior.senior_care_manager import get_senior_care_manager
         senior_care_mgr = get_senior_care_manager(
             worker_manager, get_care_plan_store(), full_config.get("senior_mode", {}))
+        worker_manager.set_care_session_callback(
+            lambda event_id: loop.call_soon_threadsafe(
+                stt_queue.put_nowait, ("care_session_start", event_id)))
         if get_active_mode() == "senior":
             senior_care_mgr.activate()
     except Exception as _senior_err:
         print(f"[SeniorCare] init skipped: {_senior_err}")
+
+    # Start only after care events have a foreground callback. A due worker in
+    # the small gap before registration used to fall back to worker-owned TTS.
+    worker_manager.start_scheduler()
 
     face_history = get_face_history()
     vision_history = get_vision_history()
@@ -1751,7 +1757,8 @@ async def main():
                     # budget restarts here (unlike a bare interim heartbeat).
                     open_listen_window()
 
-            elif event in ("endpoint", "autonomous_vision", "face_wake", "meet_stranger"):
+            elif event in ("endpoint", "autonomous_vision", "face_wake",
+                           "meet_stranger", "care_session_start"):
                 # During peeping, ignore endpoints entirely (no AI response)
                 if peeping_active and event == "endpoint":
                     continue
@@ -1797,6 +1804,7 @@ async def main():
                     return_to_background_listening()
                     continue
                 turn_active = True
+                guided_care_turn = False
                 mute_interrupted_turn.clear()
                 # Fresh barge-in kill switch for THIS turn's LLM stream(s): a
                 # set() left over from a previous hold must not abort us.
@@ -1889,6 +1897,19 @@ async def main():
                     )
                     message_history.append({"role": "system", "content": instruction})
                     print(f"[Context] Injected meet-stranger name request for {temp_name}")
+                elif event == "care_session_start":
+                    # The scheduler supplied timing and an event id, never a
+                    # fake user utterance. This now follows the exact normal
+                    # mute→recognizer-pause→model→TTS→listen lifecycle.
+                    user_utterance = ""
+                    collected_sentences = []
+                    guided_care_turn = True
+                    message_history.append({
+                        "role": "system",
+                        "content": ("[CARE SESSION STARTED BY SCHEDULE]: event id "
+                                    + str(text)),
+                    })
+                    print(f"[Care] Foreground session queued for event {text}")
                 elif event == "autonomous_vision" and not context_enabled("vision"):
                     print("[Autonomous Vision] Skipped (mode suppresses vision)")
                     collected_sentences = []
@@ -1948,6 +1969,13 @@ async def main():
 
                     # 4. Add user message to history
                     message_history.append({"role": "user", "content": user_utterance})
+                    try:
+                        from core.senior.care_plan import get_care_plan_store
+                        guided_care_turn = (
+                            get_care_plan_store().care_session_state().get("status")
+                            == "active")
+                    except Exception:
+                        guided_care_turn = False
 
                 # --- Vision Injection (every N turns) ---
                 turn_counter += 1
@@ -1977,6 +2005,7 @@ async def main():
                         or (instant_vision.enabled()
                             and instant_vision.is_instant_image_query(_last_user_msg)))
                     if (event == "endpoint"
+                            and not guided_care_turn
                             and not _spec_is_image
                             and not spec_turn.result["local_fail"]
                             and not spec_turn.abort_event.is_set()
@@ -2292,7 +2321,25 @@ async def main():
                     # First call: a normal reply, OR a silent tool call (which queues
                     # a canned filler). Returns fast for tool calls. An adopted
                     # speculative turn already IS this call — just merge it.
-                    if adopted_spec is not None:
+                    if guided_care_turn:
+                        from core.senior.care_voice_agent import run_care_voice_turn
+                        care_reply = await run_care_voice_turn(
+                            user_utterance, stop_event=turn_abort_event)
+                        marker = "CARE_ACTION_FAILED:"
+                        care_reply = str(care_reply or "").strip()
+                        if care_reply.startswith(marker):
+                            care_reply = care_reply[len(marker):].strip()
+                        gestures = extract_neck_tags(care_reply)
+                        if gestures:
+                            pending_neck.extend(gestures)
+                        spoken = strip_neck_tags(care_reply)
+                        if spoken:
+                            queue_voice_ready_text(tts_streamer, spoken)
+                        full_response = care_reply
+                        raw_first = care_reply
+                        synthetic_tool_followup = True
+                        print("[Care] Conversational care-agent turn queued directly to TTS.")
+                    elif adopted_spec is not None:
                         await loop.run_in_executor(None, merge_adopted_spec)
                         if (not adopted_spec.result["ok"] and not pending_tool_calls
                                 and not full_response.strip()):
@@ -2609,12 +2656,8 @@ async def main():
                 # We trigger background vision update if:
                 # - vision_every_message is True (every turn capture)
                 # - main_vision_enabled is True and it's time for vision injection (every N turns)
-                care_vision_every_turn = bool(
-                    senior_care_mgr is not None
-                    and senior_care_mgr.continuous_vision_required())
                 should_trigger_vision = (
                     vision_every_message
-                    or care_vision_every_turn
                     or (main_vision_enabled
                         and turn_counter % main_vision_every_n == 0))
                 if should_trigger_vision:

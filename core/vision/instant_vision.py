@@ -34,6 +34,9 @@ import json
 import time
 import threading
 import itertools
+import base64
+
+import requests
 
 from tools_and_config.config_loader import get_llm_config
 from core.brain.token_counter import count_tokens
@@ -233,54 +236,60 @@ def cap_normalized_messages(messages, max_ctx):
 
 
 def capture_best_frame_b64(cfg=None):
-    """Grab the SHARPEST of a few FRESH camera frames, JPEG-encoded to base64.
+    """Grab the SHARPEST of a few FRESH camera snapshots as base64 JPEG.
 
-    The periodic-vision path takes a single frame; live-image Q&A needs the
-    clearest shot possible to read small labels/branding (a stale or motion-blurred
-    frame is why a makhana can reads as Pringles). So we drop the MJPEG buffer
-    (CAP_PROP_BUFFERSIZE=1), sample a handful of frames, and keep the one with the
-    highest focus measure (variance of the Laplacian) — this rejects blur from a
-    moving hand/robot. Encoded at high JPEG quality, no downscaling. Falls back to
-    the plain single-frame capture on any error."""
+    The Hailo server's ``/clean`` endpoint returns the latest unannotated frame
+    over a short HTTP request.  Pulling snapshots is important here: OpenCV's
+    MJPEG/FFmpeg reader can block for 30 seconds per read while a pipeline is
+    restarting, which is catastrophic inside a spoken care turn.  We sample a
+    handful of bounded requests and retain the frame with the highest Laplacian
+    variance.  The regular Flask snapshot is a bounded fallback when the clean
+    frame server is unavailable; neither path can build an MJPEG backlog.
+    """
     cfg = cfg if cfg is not None else _cfg()
     n = max(1, int(cfg.get("capture_frames", 4)))
     quality = int(cfg.get("jpeg_quality", 92))
-    try:
-        import cv2
-        import base64 as _b64
-        cap = cv2.VideoCapture("http://localhost:5000/mjpeg", cv2.CAP_ANY)
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        if not cap.isOpened():
-            raise RuntimeError("stream not opened")
+    timeout = max(0.2, float(cfg.get("snapshot_timeout_seconds", 1.5)))
+    primary = str(cfg.get(
+        "clean_snapshot_url", "http://127.0.0.1:5001/clean"))
+    fallback = str(cfg.get(
+        "snapshot_fallback_url", "http://127.0.0.1:5000/snapshot"))
+
+    import cv2
+    import numpy as np
+
+    errors = []
+    for url, count in ((primary, n), (fallback, 1)):
         best, best_sharp, shape = None, -1.0, None
-        for _ in range(n):
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            sharp = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if sharp > best_sharp:
-                best_sharp, best, shape = sharp, frame, frame.shape
-        cap.release()
+        for _ in range(count):
+            try:
+                response = requests.get(url, timeout=(timeout, timeout))
+                response.raise_for_status()
+                frame = cv2.imdecode(
+                    np.frombuffer(response.content, dtype=np.uint8),
+                    cv2.IMREAD_COLOR)
+                if frame is None:
+                    raise RuntimeError("response was not a decodable JPEG")
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                sharp = cv2.Laplacian(gray, cv2.CV_64F).var()
+                if sharp > best_sharp:
+                    best_sharp, best, shape = sharp, frame, frame.shape
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
         if best is None:
-            raise RuntimeError("no frame read")
-        ok, buf = cv2.imencode(".jpg", best,
-                               [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            continue
+        ok, buf = cv2.imencode(
+            ".jpg", best, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
         if not ok:
-            raise RuntimeError("encode failed")
-        print(f"[InstantVision] captured sharpest of {n} frames "
+            errors.append(f"{url}: JPEG encode failed")
+            continue
+        print(f"[InstantVision] captured sharpest of {count} snapshots "
               f"(focus={best_sharp:.0f}, {shape[1]}x{shape[0]})")
-        return _b64.b64encode(buf.tobytes()).decode("utf-8")
-    except Exception as e:
-        print(f"[InstantVision] best-frame capture failed ({e}); using default capture")
-        try:
-            from core.vision.camera import capture_photo_b64
-            return capture_photo_b64()
-        except Exception:
-            return None
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+    print("[InstantVision] snapshot capture failed ("
+          + "; ".join(errors[-2:])[:500] + ")")
+    return None
 
 
 def build_capped_messages(messages, image_b64, cfg):

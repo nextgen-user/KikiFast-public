@@ -63,9 +63,10 @@ DEFAULT_STRUCTURE: Dict[str, Any] = {
     "family_contacts": [],      # {name, relationship, email, notify_on:[alert,daily_summary]}
     "reminders": [],            # {id, category, message, schedule, enabled}
     "exercises": [],            # {id, name, steps:[...], schedule, prescribed_by, enabled}
-    # A person's day: each scheduled event is a sequence Kiki carries out.
-    "routine_events": [],       # {id,title,category,schedule,actions,continuous_vision,...}
-    "active_session": None,     # persisted multi-turn routine currently being conducted
+    # A person's day.  session_brief is a rich hand-off to the conversational
+    # care model; it is deliberately not an executable script.
+    "routine_events": [],       # {id,title,category,schedule,session_brief,...}
+    "active_session": None,     # persisted care-agent conversation
     "approved_music": [],       # ["song / query", ...]
     "approved_topics": [],      # ["cricket", "old bollywood", ...]
     "care_log": [],             # {ts, kind, text}
@@ -102,6 +103,24 @@ class CarePlan:
         for key, default in DEFAULT_STRUCTURE.items():
             if key not in data:
                 data[key] = json.loads(json.dumps(default))
+        for event in data.get("routine_events", []):
+            if not str(event.get("session_brief") or "").strip():
+                legacy = event.get("actions") or []
+                event["session_brief"] = (
+                    json.dumps(legacy, ensure_ascii=False)
+                    if legacy else str(event.get("objective") or event.get("title") or ""))
+        old_session = data.get("active_session")
+        if isinstance(old_session, dict) and "transcript" not in old_session:
+            old_session["transcript"] = [
+                {
+                    "at": row.get("at", ""), "user": row.get("response", ""),
+                    "assistant": "", "visual_observation": "",
+                    "note": "Migrated from legacy scripted session.",
+                    "tools_used": [],
+                }
+                for row in (old_session.get("responses") or [])
+            ]
+            old_session["turn_count"] = len(old_session["transcript"])
         return data
 
     def save(self) -> bool:
@@ -269,10 +288,12 @@ class CarePlan:
         return self._remove_item("exercises", exercise_id)
 
     def add_routine_event(self, title: str, category: str,
-                          schedule: Dict[str, Any], actions: List[Dict[str, Any]],
+                          schedule: Dict[str, Any],
+                          actions: Optional[List[Dict[str, Any]]] = None,
                           enabled: bool = True, source: str = "user",
                           evidence: str = "", adaptation: Optional[Dict[str, Any]] = None,
-                          continuous_vision: bool = False, objective: str = ""
+                          continuous_vision: bool = False, objective: str = "",
+                          session_brief: str = ""
                           ) -> Dict[str, Any]:
         title = str(title or "").strip()
         if not title:
@@ -288,10 +309,23 @@ class CarePlan:
                 '{"kind":"daily","value":"HH:MM"} or {"kind":"once","value":'
                 '"<ISO datetime>"} or {"kind":"recurring","value":<seconds>}. '
                 f"Received: {json.dumps(raw_schedule, ensure_ascii=False, default=str)[:200]}")
+        # ``actions`` is retained only as migration input for plans created by
+        # older builds.  Runtime care never iterates it or turns it into user
+        # replies.  New plans use one rich natural-language hand-off so the
+        # care model can reason and converse instead of executing a mini DSL.
+        raw_actions = actions or []
         action_problems: List[str] = []
-        actions = _normalize_routine_actions(actions, action_problems)
-        if not actions:
+        actions = _normalize_routine_actions(raw_actions, action_problems)
+        session_brief = str(session_brief or "").strip()
+        if raw_actions and not actions and not session_brief:
             raise ValueError(_no_valid_actions_error(action_problems))
+        if not session_brief and actions:
+            session_brief = json.dumps(actions, ensure_ascii=False)
+        if not session_brief:
+            raise ValueError(
+                "routine event requires a substantive session_brief containing "
+                "the person's context, intended outcome, and any caregiver-provided "
+                "guidance; no executable dialogue script is required")
         source = str(source or "user").strip().lower()
         evidence = str(evidence or "").strip()
         if not isinstance(continuous_vision, bool):
@@ -324,10 +358,12 @@ class CarePlan:
             "objective": str(objective or title).strip(),
             "category": category,
             "schedule": schedule,
+            "session_brief": session_brief,
+            # Kept for old WebUI data only. The live care agent never advances
+            # an action index or treats these records as things already done.
             "actions": actions,
-            # While this interactive session is active, main.py captures a
-            # fresh frame after every turn through the existing Gemini vision
-            # pipeline and injects its description before the next turn.
+            # A fresh frame is visually adjudicated before every care-agent
+            # turn and supplied as evidence to the conversational model.
             "continuous_vision": bool(continuous_vision),
             "enabled": bool(enabled),
             "source": source,
@@ -357,6 +393,10 @@ class CarePlan:
             raise ValueError("routine event title cannot be empty")
         if "objective" in fields:
             fields["objective"] = str(fields["objective"] or "").strip()
+        if "session_brief" in fields:
+            fields["session_brief"] = str(fields["session_brief"] or "").strip()
+            if not fields["session_brief"]:
+                raise ValueError("routine event session_brief cannot be empty")
         if "schedule" in fields:
             fields["schedule"] = _normalize_schedule(fields["schedule"])
             if not _valid_schedule(fields["schedule"]):
@@ -380,12 +420,54 @@ class CarePlan:
                 self.data["active_session"] = None
         return self._remove_item("routine_events", event_id)
 
+    def _session_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """Return a conversational event for any scheduled care-plan item.
+
+        ``routine_events`` are canonical.  Reminders and exercises predate that
+        model, but a due legacy item must still enter the same foreground care
+        conversation instead of reviving the old worker-authored dialogue path.
+        The adapter carries stored facts across verbatim; it does not manufacture
+        an execution sequence or claim any step occurred.
+        """
+        event = next((item for item in self.data.get("routine_events", [])
+                      if item.get("id") == event_id), None)
+        if event is not None:
+            return json.loads(json.dumps(event))
+
+        reminder = next((item for item in self.data.get("reminders", [])
+                         if item.get("id") == event_id), None)
+        if reminder is not None:
+            return {
+                **json.loads(json.dumps(reminder)),
+                "title": reminder.get("message") or "Care reminder",
+                "objective": reminder.get("message") or "Care reminder",
+                "session_brief": (
+                    "Legacy care-plan reminder record (stored user/caregiver "
+                    "context): " + json.dumps(reminder, ensure_ascii=False)),
+                "continuous_vision": bool(reminder.get("continuous_vision", False)),
+                "_legacy_kind": "reminder",
+            }
+
+        exercise = next((item for item in self.data.get("exercises", [])
+                         if item.get("id") == event_id), None)
+        if exercise is not None:
+            return {
+                **json.loads(json.dumps(exercise)),
+                "title": exercise.get("name") or "Care exercise",
+                "objective": exercise.get("name") or "Care exercise",
+                "session_brief": (
+                    "Legacy care-plan exercise record (stored user/caregiver "
+                    "context): " + json.dumps(exercise, ensure_ascii=False)),
+                "continuous_vision": bool(exercise.get("continuous_vision", False)),
+                "_legacy_kind": "exercise",
+            }
+        return None
+
     def start_care_session(self, event_id: str) -> Dict[str, Any]:
         with self._lock:
-            event = next((item for item in self.data.get("routine_events", [])
-                          if item.get("id") == event_id), None)
+            event = self._session_event(event_id)
             if event is None:
-                raise ValueError("no routine event with that id")
+                raise ValueError("no scheduled care item with that id")
             active = self.data.get("active_session")
             if isinstance(active, dict) and active.get("status") == "active":
                 if active.get("event_id") == event_id:
@@ -398,15 +480,17 @@ class CarePlan:
                 "event_id": event_id,
                 "event_title": event.get("title", ""),
                 "status": "active",
-                "action_index": 0,
                 "started_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
-                "responses": [],
-                # This is a session-local outline. The voice AI may adapt,
-                # repeat, skip, or replace its remaining steps without silently
-                # changing the recurring caregiver-approved routine.
-                "session_actions": json.loads(json.dumps(event.get("actions", []))),
-                "adaptations": [],
+                "turn_count": 0,
+                "transcript": [],
+                # Freeze the complete care context at the start. Cerebras is a
+                # stateless API, so this same snapshot is resent on later turns;
+                # its prompt cache makes that stable prefix inexpensive.
+                "care_context": json.loads(json.dumps({
+                    **self.data,
+                    "active_session": None,
+                })),
                 "vision_override": None,
             }
             self.data["active_session"] = session
@@ -415,74 +499,48 @@ class CarePlan:
         return self.care_session_state()
 
     def advance_care_session(self, response: str = "") -> Dict[str, Any]:
-        with self._lock:
-            session = self.data.get("active_session")
-            if not isinstance(session, dict) or session.get("status") != "active":
-                raise ValueError("there is no active care session")
-            event = next((item for item in self.data.get("routine_events", [])
-                          if item.get("id") == session.get("event_id")), None)
-            if event is None:
-                raise ValueError("the active session's routine event no longer exists")
-            actions = session.get("session_actions") or event.get("actions", [])
-            current_index = int(session.get("action_index", 0))
-            presented = _routine_turn_actions(actions, current_index)
-            if str(response or "").strip():
-                session.setdefault("responses", []).append({
-                    "at": datetime.now().isoformat(),
-                    "action_index": current_index,
-                    "response": str(response).strip()[:500],
-                })
-            # One care turn may contain an introduction plus the first actual
-            # check-in. Advance past everything Kiki just presented, not merely
-            # one array element, so replies are attached to the right step.
-            session["action_index"] = current_index + len(presented)
-            session["updated_at"] = datetime.now().isoformat()
-            if session["action_index"] >= len(actions):
-                session["status"] = "completed"
-                session["completed_at"] = datetime.now().isoformat()
-            else:
-                next_actions = _routine_turn_actions(
-                    actions, session["action_index"])
-                # No reply is needed after a trailing close/log/notification
-                # batch. Return it once as completion_actions and finish the
-                # session; the care agent still performs those actions.
-                if next_actions and not any(
-                        action.get("needs_response") for action in next_actions):
-                    session["completion_actions"] = next_actions
-                    session["action_index"] = len(actions)
-                    session["status"] = "completed"
-                    session["completed_at"] = datetime.now().isoformat()
-        if not self.save():
-            raise IOError("could not persist care-session progress")
-        return self.care_session_state()
+        """Legacy alias: record what the person said without advancing a script."""
+        return self.record_care_turn(user_text=response)
 
     def adapt_care_session(self, response: str, remaining_actions: List[Dict[str, Any]],
                            reason: str = "") -> Dict[str, Any]:
-        """Replace the current-and-remaining outline for this session only."""
-        replacement = _normalize_routine_actions(remaining_actions)
-        if not replacement:
-            raise ValueError("adaptive session change requires remaining_actions")
+        """Legacy alias: record a deviation for conversational context only."""
+        note = str(reason or "").strip()
+        if remaining_actions:
+            note += (" | User-requested direction: "
+                     + json.dumps(remaining_actions, ensure_ascii=False))
+        return self.record_care_turn(user_text=response, note=note)
+
+    def record_care_turn(self, user_text: str = "", assistant_text: str = "",
+                         visual_observation: str = "", note: str = "",
+                         tools_used: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Persist one real microphone→care-model exchange.
+
+        There is intentionally no action counter. Only speech actually heard,
+        speech actually delivered, tool use, and grounded visual evidence are
+        recorded; the conversational care model decides what to do next.
+        """
         with self._lock:
             session = self.data.get("active_session")
             if not isinstance(session, dict) or session.get("status") != "active":
                 raise ValueError("there is no active care session")
-            event = next((item for item in self.data.get("routine_events", [])
-                          if item.get("id") == session.get("event_id")), None)
-            if event is None:
-                raise ValueError("the active session's routine event no longer exists")
-            actions = session.get("session_actions") or event.get("actions", [])
-            idx = max(0, int(session.get("action_index", 0)))
-            session["session_actions"] = (
-                json.loads(json.dumps(actions[:idx])) + replacement)
-            session.setdefault("adaptations", []).append({
+            turn = {
                 "at": datetime.now().isoformat(),
-                "action_index": idx,
-                "response": str(response or "").strip()[:500],
-                "reason": str(reason or "").strip()[:500],
-            })
+                "user": str(user_text or "").strip()[:2000],
+                "assistant": str(assistant_text or "").strip()[:4000],
+                "visual_observation": str(visual_observation or "").strip()[:3000],
+                "note": str(note or "").strip()[:1000],
+                "tools_used": [str(name) for name in (tools_used or [])][:20],
+            }
+            if any(value for key, value in turn.items() if key != "at"):
+                transcript = session.setdefault("transcript", [])
+                transcript.append(turn)
+                if len(transcript) > 100:
+                    del transcript[:len(transcript) - 100]
+                session["turn_count"] = int(session.get("turn_count", 0)) + 1
             session["updated_at"] = datetime.now().isoformat()
         if not self.save():
-            raise IOError("could not persist care-session adaptation")
+            raise IOError("could not persist care-session turn")
         return self.care_session_state()
 
     def set_care_session_vision(self, enabled: bool) -> Dict[str, Any]:
@@ -508,10 +566,12 @@ class CarePlan:
             if not isinstance(session, dict):
                 raise ValueError("there is no care session to finish")
             if str(response or "").strip():
-                session.setdefault("responses", []).append({
+                session.setdefault("transcript", []).append({
                     "at": datetime.now().isoformat(),
-                    "action_index": session.get("action_index", 0),
-                    "response": str(response).strip()[:500],
+                    "user": str(response).strip()[:2000],
+                    "assistant": "", "visual_observation": "",
+                    "note": f"Session {status} by conversational agent/user.",
+                    "tools_used": [],
                 })
             session["status"] = status
             session["updated_at"] = datetime.now().isoformat()
@@ -525,19 +585,9 @@ class CarePlan:
             session = json.loads(json.dumps(self.data.get("active_session")))
             if not isinstance(session, dict):
                 return {"status": "none"}
-            event = next((item for item in self.data.get("routine_events", [])
-                          if item.get("id") == session.get("event_id")), None)
+            event = self._session_event(session.get("event_id"))
             if event:
-                actions = session.get("session_actions") or event.get("actions", [])
-                idx = int(session.get("action_index", 0))
-                session["total_actions"] = len(actions)
-                turn_actions = (
-                    _routine_turn_actions(actions, idx)
-                    if session.get("status") == "active" else [])
-                session["turn_actions"] = turn_actions
-                session["current_action"] = turn_actions[-1] if turn_actions else None
-                session["awaiting_response"] = any(
-                    action.get("needs_response") for action in turn_actions)
+                session["event"] = event
                 override = session.get("vision_override")
                 session["continuous_vision"] = (
                     override if isinstance(override, bool)

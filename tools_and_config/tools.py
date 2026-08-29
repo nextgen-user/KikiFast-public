@@ -1691,7 +1691,9 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
                         "it should run. For a daily reminder, save schedule as "
                         "{'kind':'daily','value':'HH:MM'} after the user answers.")
         if section == "routine_event" and action == "add":
-            missing = [key for key in ("title", "schedule", "actions") if not d.get(key)]
+            missing = [key for key in ("title", "schedule") if not d.get(key)]
+            if not d.get("session_brief") and not d.get("actions"):
+                missing.append("session_brief")
             if missing:
                 return ("NEEDS_CLARIFICATION: No routine event was saved. Missing: "
                         + ", ".join(missing) + ".")
@@ -1740,6 +1742,7 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
                     adaptation=d.get("adaptation"),
                     continuous_vision=d.get("continuous_vision", False),
                     objective=d.get("objective", ""),
+                    session_brief=d.get("session_brief", ""),
                 )
                 scheduled_item_id = item["id"]
                 receipt_metadata = {
@@ -2947,7 +2950,7 @@ TOOLS = [
                 "properties": {
                     "section": {"type": "string", "description": "routine_event | care_session | reminder | exercise | family_contact | approved_music | approved_topics | senior | care_log"},
                     "action": {"type": "string", "description": "routine_event: add/edit/remove; care_session: start/advance/adapt/set_vision/complete/cancel/decline; others: add/edit/remove/set"},
-                    "data": {"type": "object", "description": "routine_event add: {title,objective,category,schedule:{kind,value},actions:[{type,instruction,needs_response,success_signal,on_concern,vital_type?}],continuous_vision:boolean,source,evidence,adaptation}. Actions are adaptable goals, not fixed dialogue. Action types include speak,check_in,guided_step,measure_vital,memory_activity,observe,log,notify_caregiver. For MAX30102 use category=vitals and {type:measure_vital,vital_type:heart_rate}. care_session adapt changes only the live session unless routine_event is explicitly edited. Preserve original language."}
+                    "data": {"type": "object", "description": "routine_event add: {title,objective,category,schedule:{kind,value},session_brief:string,continuous_vision:boolean,source,evidence,adaptation}. session_brief is a substantive natural-language hand-off containing the person's relevant context, intended outcome, caregiver-provided material and constraints; it is not executable dialogue or a short action list. care_session supports start,set_vision,complete,cancel,decline. Preserve original language."}
                 },
                 "required": ["section", "action"]
             }
