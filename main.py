@@ -768,6 +768,16 @@ async def main():
                     _mgr.deactivate()
         except Exception as _senior_err:
             print(f"[SeniorCare] mode-change hook failed: {_senior_err}")
+        # Environment polling follows the same capability, at the same boundary.
+        try:
+            from core.health.environment import get_environment_provider
+            _env = get_environment_provider()
+            if mode_has_capability("environment"):
+                _env.start()
+            else:
+                _env.stop()
+        except Exception as _env_err:
+            print(f"[Environment] mode-change hook failed: {_env_err}")
         if rewarm:
             register_history(message_history)
         return True
@@ -1074,6 +1084,19 @@ async def main():
             senior_care_mgr.activate()
     except Exception as _senior_err:
         print(f"[SeniorCare] init skipped: {_senior_err}")
+
+    # --- Environment: weather + air quality for the health-companion modes ---
+    # One daemon thread, off the speaking path entirely (see the module docstring).
+    # Started here rather than lazily on first use so the first briefing of the
+    # day already has a reading instead of paying a cold fetch mid-sentence.
+    try:
+        from core.health.environment import get_environment_provider
+        _env = get_environment_provider(full_config.get("environment", {}))
+        if mode_has_capability("environment") and _env.start():
+            print(f"[Environment] Polling {_env.place or 'configured coordinates'} "
+                  f"every {_env.poll_seconds}s")
+    except Exception as _env_err:
+        print(f"[Environment] init skipped: {_env_err}")
 
     # Start only after care events have a foreground callback. A due worker in
     # the small gap before registration used to fall back to worker-owned TTS.

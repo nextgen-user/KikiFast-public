@@ -114,6 +114,8 @@ KikiFast/
 │   │   ├── worker_engine.py    # Dataclasses: Worker, WorkerTrigger, WorkerCondition, enums
 │   │   ├── worker_brain.py     # execute_worker (builds prompt → run_agent_loop), face/vision buffers
 │   │   └── worker_manager.py   # Scheduler thread, persistence, lifecycle events, live-toggle reload listener
+│   ├── health/
+│   │   └── environment.py  # Open-Meteo weather + air quality; CPCB AQI; freshness lifecycle
 │   ├── senior/
 │   │   ├── care_plan.py        # Whole-day session briefs + real transcript + trusted health trends
 │   │   ├── care_voice_agent.py # Persistent multimodal Cerebras care dialogue + fresh frame/turn
@@ -2050,6 +2052,42 @@ listening — it adds a caregiver **care plan** and family **email** on top.
 
 ---
 
+### 5.25 `core/health/environment.py` — weather and air quality
+
+The half of the SIH statement (heat waves, pollution events, early warning) that previously had
+no code at all. Two free unauthenticated Open-Meteo endpoints — forecast (temperature, apparent
+temperature, humidity) and air quality (PM2.5, PM10, US AQI) — polled by **one daemon thread**,
+never from a voice turn. Readers get a deep copy, so a caller formatting a prompt cannot watch
+the dict mutate mid-render. Active only under the `environment` capability (`health_sih`).
+
+- **Freshness is a lifecycle, not a flag**: `fresh` → `stale` at 30 min → `unavailable` at 2 h
+  (`environment.stale_after_seconds` / `unavailable_after_seconds`). An `unavailable` snapshot
+  carries **no values at all** — returning the numbers next to an `available: False` flag is how
+  a two-hour-old AQI eventually gets spoken as the current one. A failed poll does **not** reset
+  the timestamp, so a permanently-down feed ages out instead of looking permanently fresh.
+- **Partial results count.** Air quality alone is worth storing on a day the forecast endpoint is
+  down, and vice versa; only a total outage leaves the previous reading in place to keep ageing.
+- **AQI is computed on India's CPCB scale**, not taken from the feed. Open-Meteo returns US and
+  European AQI, and neither is what a Delhi advisory, a news bulletin, or a doctor means by "AQI".
+  `cpcb_aqi()` takes the **max** PM2.5/PM10 sub-index (CPCB never averages them) and reports which
+  pollutant drove it. Two deliberate details: the published integer bands (0–30, 31–60, …) are used
+  as **continuous** intervals, or a concentration of 120.6 would fall down the gap between 120 and
+  121 and be dropped; and a concentration above the scale reports the 500 ceiling rather than
+  extrapolating a number no Indian source would print. **Caveat that must reach the user:** the
+  official CPCB AQI uses 24-hour averages over up to eight pollutants, while this uses the current
+  hourly PM. It is an estimate on the CPCB scale and must never be spoken with station authority.
+- **Heat is banded on apparent temperature**, not the raw reading: 38 °C dry and 38 °C at 80%
+  humidity are not the same event for someone with a heart condition, and only the apparent figure
+  knows the difference. Bands: `none` <32, `caution` <38, `high` <45, `very high` <54, `extreme`.
+- **`compact_line()` is silent by default** — it returns `""` on an ordinary day. It only speaks up
+  for a non-`none` heat band or an AQI worse than `satisfactory`, and appends its age when stale.
+  Every character it returns is re-prefilled on every turn (§4), and a companion that announces
+  pleasant weather each turn is one the person stops listening to.
+- Wired in `main.py` next to the care bridge: started at boot and toggled by `sync_mode_prompt` on
+  the same cache-safe capability boundary.
+
+---
+
 ## 6. `tools_and_config/config.json` Reference
 
 | Block | Key points |
@@ -2059,6 +2097,7 @@ listening — it adds a caregiver **care plan** and family **email** on top.
 | `idle_mind` | The only background cognition configuration: provider/model/fallback/thinking level, state/journal paths, scheduling limits, and tool budgets. |
 | `action_agent` | The `complex_query` multi-step agent (§5.2c): provider (`cerebras` default / `groq` fallback), per-provider model and context caps, turn/tool budgets, and the wall-clock deadline. Cloud-only; never uses the local slot. |
 | `senior_mode.care_agent` | Foreground guided-care limits plus the direct-image and JPEG controls. Conversation and enabled per-turn vision reuse one latency-critical Cerebras/Gemma `action_agent` request. |
+| `environment` | Home coordinates, poll interval, and the stale/unavailable thresholds for weather + air quality (§5.25). Polled only under the `environment` capability. Open-Meteo needs no key, so this costs nothing against `cloud_limits`. |
 | `always_listen_config` | Capture-only buffer path and transcript size limits. |
 | `cloud_limits` | Global and active-category caps; `idle_mind` has its own row. Zero means unlimited. |
 | `knowledge_base` | Durable-memory path and startup context limits. |

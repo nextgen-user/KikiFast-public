@@ -254,9 +254,14 @@ Caregiver PWA / senior voice request / Unified Idle Mind evidence
   reported provenance.
 - [ ] Support heart rate, future trusted SpO2, body temperature, steps, activity, sleep, and last
   activity fields without requiring all fields at once.
-- [ ] Poll weather/AQI for configured home coordinates; retain latest-good value with age/source.
-- [ ] Track temperature, apparent temperature, humidity, AQI, PM2.5, and PM10.
-- [ ] Mark environment readings stale after 30 minutes and unavailable after two hours.
+- [x] Poll weather/AQI for configured home coordinates; retain latest-good value with age/source.
+  `core/health/environment.py`, Open-Meteo forecast + air-quality, one daemon thread, no API key.
+- [x] Track temperature, apparent temperature, humidity, AQI, PM2.5, and PM10.
+  AQI is computed on India's **CPCB** scale (max PM2.5/PM10 sub-index) because Open-Meteo returns
+  only US/European AQI, which is not the number an Indian advisory means. Documented as an estimate:
+  official CPCB uses 24h averages, this uses the current hourly PM.
+- [x] Mark environment readings stale after 30 minutes and unavailable after two hours. An
+  unavailable snapshot carries no values at all, and a failed poll does not reset the timestamp.
 - [ ] Create deterministic normal, attention, and urgent demo telemetry scenarios.
 - [ ] Build one ephemeral compact `CARE NOW` snapshot, target maximum 80 tokens, containing only
   noteworthy environment/vitals, next due item, medicine state, and active advisory.
@@ -432,7 +437,8 @@ deferred.
 | 2026-08-29 | runtime | 18:40 daily neck event | Event persisted at 18:54; did not trigger or clarify past-time intent | Scheduling gate remains open |
 | 2026-08-29 | runtime | 19:07 one-shot neck event | Fired once at 19:07:04; adaptive visual voice session ran for eight turns | Upcoming one-shot path accepted; session completion still open |
 | 2026-08-29 | `d0fe638` | Care reliability checkpoint | Current scheduler/session/claim fixes and tests checkpointed and pushed | Requires targeted real-device retest |
-| 2026-08-29 | pending | Mode capabilities + `health_sih` | Five `== "senior"` gates replaced by `mode_has_capability`; `health_sih` added; 11 new tests pass, suite 655 passed / 9 pre-existing failures unchanged | Phase H0 implemented; real-boot gate still required |
+| 2026-08-29 | `1b69ef0` | Mode capabilities + `health_sih` | Five `== "senior"` gates replaced by `mode_has_capability`; `health_sih` added; 11 new tests pass, suite 655 passed / 9 pre-existing failures unchanged | Phase H0 implemented; real-boot gate still required |
+| 2026-08-29 | pending | Environment provider (Phase G-lite) | Live Delhi read: 29.2C / feels 34.8C / 75% RH, PM2.5 120.6, PM10 338.1 -> CPCB 301 "very poor" (US AQI 376 for comparison). 33 new tests; suite 688 passed / 9 pre-existing failures unchanged | Weather+AQI implemented; snapshot injection and real-boot gate still required |
 
 ## Next exact gate
 
