@@ -290,25 +290,78 @@ Caregiver PWA / senior voice request / Unified Idle Mind evidence
 }
 ```
 
+## Phase H0 — Assistant modes: companion, senior, and the SIH health companion
+
+The SIH statement asks for a **personal health companion**, not only an elderly-care assistant.
+Kiki now ships three relevant modes rather than one.
+
+| Mode | Persona | Capabilities | Purpose |
+|---|---|---|---|
+| `default` | Kiki herself — friend, wit, curiosity | *(none)* | Everyday companion. Already reaches WhatsApp, Gmail, Notion, music, memory, and vision through `complex_query`; nothing needed to be added. |
+| `senior` | Hindi-locked caregiver | `care` | Elderly care. Behaviour unchanged. |
+| `health_sih` | Kiki's own personality + health layer, bilingual | `care`, `environment`, `companion` | The SIH health companion: default's companionship **and** senior's whole care stack. |
+
+- [x] Replace the five hardcoded `get_active_mode() == "senior"` gates with a declared capability
+  (`assistant_modes.modes.<mode>.capabilities`) read through
+  `core/runtime_controls.py::mode_has_capability()`. Nothing under `core/senior/` ever checked the
+  mode, so those five gates were the entire coupling; naming the capability lets `health_sih`
+  inherit the whole care stack with no duplicated wiring and no change to `senior`.
+- [x] `mode_has_capability()` fails **closed**, unlike `context_enabled()`: a capability starts
+  subsystems that speak on a schedule and email families.
+- [x] Add the `health_sih` mode with senior's `main_tools` (already a superset of the global list)
+  and a prompt that keeps Kiki's identity, answers in the language it is spoken to, and forbids
+  diagnosis, invented readings, and treating an empty camera frame as a medical event.
+- [x] `tests/test_mode_capabilities.py` pins the contract, the fail-closed behaviour, the shipped
+  config, and the spoken names ("health", "health mode", "health companion").
+- [ ] **Phase H0 locked on real Kiki**: boot `health_sih`, confirm care workers materialize, confirm
+  music/WhatsApp/memory still work, confirm `senior` is unchanged, confirm `default` schedules nothing.
+
 ## Phase H — Senior companion intelligence and winning experiences
 
+### Implementation approach
+
+Two hard prerequisites, in this order:
+
+1. **Session completion must be deterministic** (Phase B, `plan.md` line ~126: `active_session` did
+   not clear after the 19:07 session). Phase H adds at least two more scheduled sessions per day
+   plus check-ins; sessions that do not close collide and block each other. This is a **harder**
+   prerequisite for Phase H than the environment work.
+2. **Environment ingestion must exist** (Phase G). There is currently *no* weather, AQI, air-quality,
+   or location code anywhere in the repo, so the morning briefing, the lifestyle follow-ups, and the
+   wellness indicators below cannot be built truthfully — and the SIH heat/flood/pollution claim has
+   nothing behind it. Build `core/health/environment.py` (Open-Meteo forecast + air-quality: free,
+   no key, gives apparent temperature, PM2.5, PM10) with latest-good retention, stale at 30 min,
+   unavailable at 2 h, plus the compact `CARE NOW` snapshot injected like the time anchor.
+
+Then most of Phase H is **data, not new code paths.** Per the architecture decisions above, a care
+event stores a rich goal/context/session brief and the care agent decides how to conduct it. So the
+morning briefing, evening reflection, and the food/hydration/walk/sleep follow-ups are **seeded
+`routine_events` with well-written `session_brief` text**, conducted by the existing
+`care_voice_agent` — no new session engine, scheduler, or speech path. Only three items need genuinely
+new mechanism: Idle Mind care awareness, the memory-aid sections, and the dashboard.
+
 - [ ] Morning briefing: greeting, weather/AQI, medicine/routine overview, appointments, and a
-  relevant family event.
+  relevant family event. *(seeded routine_event; needs Phase G)*
 - [ ] Evening reflection: confirmed care outcomes, gentle missed-item follow-up, and tomorrow's
-  appointments.
+  appointments. *(seeded routine_event)*
 - [ ] Food, hydration, walking, lifestyle, and sleep follow-ups based on the care plan and compact
-  state—supportive and non-shaming.
+  state—supportive and non-shaming. *(seeded routine_events; needs Phase G)*
 - [ ] Inactivity check-ins based on time, available activity evidence, and personal baseline; never
-  equate “not visible to camera” with a medical event.
-- [ ] Mood check-ins and optional caregiver-summary inclusion.
+  equate “not visible to camera” with a medical event. *(Unified Idle Mind)*
+- [ ] Mood check-ins and optional caregiver-summary inclusion. *(Unified Idle Mind)*
 - [ ] Boredom cure: approved jokes, word games, reminiscence prompts, music, and simple memory/care
-  games chosen naturally by Unified Idle Mind.
+  games chosen naturally by Unified Idle Mind. *(NEW MECHANISM: `unified_idle_mind.py` currently has
+  no mode awareness and no care context at all. Needs the compact snapshot, the active mode, and a
+  companionship action type. Keep `update_care_plan`/`alert_family` blocked to it — that is correct.)*
 - [ ] Structured non-diagnostic memory assistance for appointments, medication schedules, family
-  events, object locations explicitly told to Kiki, later tasks, and life stories.
+  events, object locations explicitly told to Kiki, later tasks, and life stories. *(NEW: care_plan
+  sections + tools, following the existing `add_to_list`/`_edit_item` patterns.)*
 - [ ] Caregiver family notes delivered naturally once or at a scheduled time.
 - [ ] Personal wellness dashboard with trends and explainable heat, respiratory, and cardiovascular
-  wellness indicators based only on available data.
-- [ ] Rehearse a full day-in-the-life with Alex as the senior and a phone as caregiver.
+  wellness indicators based only on available data. *(NEW: extend the existing Flask webui on :8090
+  with a care view rather than blocking on the Phase F PWA. Needs Phase G for the indicators.)*
+- [ ] Rehearse a full day-in-the-life with Alex as the senior and a phone as caregiver, in
+  `health_sih` mode.
 - [ ] **Phase H locked on real Kiki.**
 
 ## Phase I — Reliability, SIH documentation, and final video
@@ -359,7 +412,14 @@ that the core voice-and-vision concept works.
 
 The immediate unfinished gate is **reliability acceptance**, not the PWA: resolve past-time
 scheduling semantics, prove edit/delete/restart/overlap behavior, close sessions cleanly, and
-physically validate a trusted heart-rate reading. After those are locked, proceed in order through
+physically validate a trusted heart-rate reading.
+
+The second gap is **environment data**. The SIH statement is about heat waves, floods, pollution
+events, and early warning, and there is currently no weather, AQI, air-quality, or location code
+anywhere in the repository. Phase G is therefore not an optional enrichment phase — it is the
+difference between a care assistant and the health companion the statement asks for, and Phase H's
+briefing, lifestyle follow-ups, and wellness indicators all depend on it. Phase H0 (mode
+capabilities and `health_sih`) is done and unblocks the rest without touching senior mode. After those are locked, proceed in order through
 medicine occurrence state, WhatsApp/Gmail, caregiver PWA, compact environment/telemetry context,
 senior companion experiences, and SIH hardening. Wearable-only sensing and fall detection remain
 deferred.
@@ -372,6 +432,7 @@ deferred.
 | 2026-08-29 | runtime | 18:40 daily neck event | Event persisted at 18:54; did not trigger or clarify past-time intent | Scheduling gate remains open |
 | 2026-08-29 | runtime | 19:07 one-shot neck event | Fired once at 19:07:04; adaptive visual voice session ran for eight turns | Upcoming one-shot path accepted; session completion still open |
 | 2026-08-29 | `d0fe638` | Care reliability checkpoint | Current scheduler/session/claim fixes and tests checkpointed and pushed | Requires targeted real-device retest |
+| 2026-08-29 | pending | Mode capabilities + `health_sih` | Five `== "senior"` gates replaced by `mode_has_capability`; `health_sih` added; 11 new tests pass, suite 655 passed / 9 pre-existing failures unchanged | Phase H0 implemented; real-boot gate still required |
 
 ## Next exact gate
 

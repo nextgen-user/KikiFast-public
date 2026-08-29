@@ -225,6 +225,51 @@ def context_enabled(source):
         return True
 
 
+# Optional per-mode feature switches. A mode declares them as
+# ``assistant_modes.modes.<mode>.capabilities: ["care", ...]``.
+#
+#   care         the senior-care stack: scheduled routine events, the
+#                foreground care-voice agent, care-plan routing, alert_family
+#   environment  weather/AQI ingestion and the compact CARE NOW snapshot
+#   companion    proactive companionship activities from Unified Idle Mind
+#
+# These exist because the five call sites that used to test
+# ``get_active_mode() == "senior"`` were the ONLY thing binding the entire
+# care stack to one mode name. Nothing under ``core/senior/`` ever checked the
+# mode, so the coupling was purely in the gates. Naming the capability instead
+# of the mode is what lets ``health_sih`` inherit the whole stack without a
+# second copy of it, and it keeps ``senior`` behaving byte-identically.
+_MODE_CAPABILITIES = ("care", "environment", "companion")
+
+
+def get_mode_capabilities(mode=None):
+    """The capability set the given (default: active) mode declares."""
+    try:
+        entry = _modes().get(mode or get_active_mode(), {})
+        if not isinstance(entry, dict):
+            return frozenset()
+        declared = entry.get("capabilities")
+        if not isinstance(declared, (list, tuple, set)):
+            return frozenset()
+        return frozenset(
+            str(name).strip().lower() for name in declared
+            if str(name).strip().lower() in _MODE_CAPABILITIES
+        )
+    except Exception:
+        return frozenset()
+
+
+def mode_has_capability(capability, mode=None):
+    """True when the given (default: active) mode enables this capability.
+
+    Fails CLOSED, unlike :func:`context_enabled`. A capability turns a whole
+    subsystem on — care workers that speak on a schedule, outbound family
+    alerts — so an unreadable config must leave them off rather than switch
+    them on in a mode that never asked for them.
+    """
+    return str(capability).strip().lower() in get_mode_capabilities(mode)
+
+
 def mode_has_own_character():
     """True when the ACTIVE mode declares its own ``system_prompt``.
 

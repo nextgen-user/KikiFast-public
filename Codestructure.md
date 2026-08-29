@@ -1948,7 +1948,8 @@ settings at process startup; restart after changing those values.
 
 ### 5.24 `core/senior/` — Senior Citizen Mode (elderly-care addon)
 
-Strictly **additive** addon; active only while the `senior` assistant mode is selected. Reuses the
+Strictly **additive** addon; active only while a mode declaring the `care` capability is selected
+(`senior`, `health_sih` — see the mode-capabilities bullet below). Reuses the
 existing speaking path, workers scheduler, face recognition, memory search, Unified Idle Mind and ambient
 listening — it adds a caregiver **care plan** and family **email** on top.
 
@@ -2022,11 +2023,30 @@ listening — it adds a caregiver **care plan** and family **email** on top.
 - **Per-mode `main_tools`**: `core/llm.py _effective_main_tools()` honors an optional
   `assistant_modes.modes.<mode>.main_tools` override (senior adds `complex_query` and emergency tools), else the global
   `llm.main_tools`. Cache-safe — a mode switch already replaces msg[0] and re-warms (§4).
+- **Mode capabilities, not mode names** (2026-08-29): a mode declares
+  `assistant_modes.modes.<mode>.capabilities: ["care", "environment", "companion"]`, and
+  `core/runtime_controls.py::mode_has_capability()` is what every gate tests. Five call sites used
+  to compare `get_active_mode() == "senior"` — `main.py` startup activation and the `sync_mode_prompt`
+  hook, plus three in `core/llm.py` (the `complex_query` hint, the "only complex_query touches the
+  care plan" rule, and `care_scope` in `_should_route_complex_query`). Nothing under `core/senior/`
+  ever read the active mode, so those five gates were the *entire* coupling between the care stack
+  and one mode name. Naming the capability lets a second mode inherit the whole stack with no
+  duplicate wiring. Unlike `context_enabled()`, `mode_has_capability()` fails **closed**: a
+  capability starts subsystems that speak on a schedule and email families, so an unreadable config
+  must leave them off rather than switch them on in a mode that never asked.
+- **`health_sih` mode** — the SIH health-companion mode: `capabilities: ["care", "environment",
+  "companion"]` and the same `main_tools` as `senior`. That list is already a superset of the global
+  `llm.main_tools` (it adds `alert_family` + `start_care_session`), so the mode keeps every ordinary
+  Kiki capability — music, memory, vision, and WhatsApp/Gmail through `complex_query` — while gaining
+  the full care surface. Its system prompt keeps Kiki's own personality and answers in whatever
+  language it is spoken to, where `senior` replaces the persona with a Hindi-locked caregiver. Voice
+  resolution accepts "health", "health mode", "health companion", and "health sih".
 - **Wiring** (`main.py`): the manager singleton and foreground callback are registered before
   `worker_manager.start_scheduler()` (so even an immediately-due event cannot fall through to worker speech),
-  activates if `active_on_startup == "senior"`, and `sync_mode_prompt` (the cache-safe mode boundary)
-  activates/deactivates on mode change. Boot straight into it via `assistant_modes.active_on_startup:
-  "senior"`, or say "switch to senior citizen mode".
+  activates if the startup mode has the `care` capability, and `sync_mode_prompt` (the cache-safe mode
+  boundary) activates/deactivates on mode change. Boot straight into it via
+  `assistant_modes.active_on_startup: "senior"` / `"health_sih"`, or say "switch to senior citizen
+  mode" / "switch to health mode".
 
 ---
 

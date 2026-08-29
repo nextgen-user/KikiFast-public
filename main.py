@@ -93,6 +93,7 @@ from core.runtime_controls import (
     get_context_policy,
     get_mode_revision,
     is_shut_up_command,
+    mode_has_capability,
 )
 
 print(f"[Main] All modules initialized in {time.time() - t0:.2f}s\n")
@@ -753,12 +754,15 @@ async def main():
         mode_revision = latest_revision
         new_mode = get_active_mode()
         print(f"[Mode] System prompt changed to '{new_mode}' mode.")
-        # Senior Citizen Mode: (de)activate care workers at this cache-safe boundary.
+        # Care modes: (de)activate care workers at this cache-safe boundary.
+        # Keyed on the `care` capability, not the mode NAME, so `senior` and
+        # `health_sih` share one care stack instead of one of them silently
+        # scheduling nothing.
         try:
             from core.senior.senior_care_manager import get_senior_care_manager
             _mgr = get_senior_care_manager()
             if _mgr is not None:
-                if new_mode == "senior":
+                if mode_has_capability("care"):
                     _mgr.activate()
                 elif _mgr.is_active():
                     _mgr.deactivate()
@@ -1049,7 +1053,8 @@ async def main():
     worker_manager = get_worker_manager(loop, message_history=message_history)
 
     # --- Senior Citizen Mode: bridge the care plan onto the workers scheduler ---
-    # Additive: only does anything while the 'senior' assistant mode is active.
+    # Additive: only does anything while a mode with the `care` capability
+    # ('senior', 'health_sih') is active.
     senior_care_mgr = None
     try:
         from core.senior.care_plan import get_care_plan_store
@@ -1065,7 +1070,7 @@ async def main():
         # rather than voicing anything from the tool thread.
         from core.senior.senior_care_manager import set_foreground_hook
         set_foreground_hook(_queue_care_session)
-        if get_active_mode() == "senior":
+        if mode_has_capability("care"):
             senior_care_mgr.activate()
     except Exception as _senior_err:
         print(f"[SeniorCare] init skipped: {_senior_err}")
