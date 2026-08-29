@@ -111,7 +111,7 @@ KikiFast/
 │   │   └── worker_manager.py   # Scheduler thread, persistence, lifecycle events, live-toggle reload listener
 │   ├── senior/
 │   │   ├── care_plan.py        # Whole-day session briefs + real transcript + trusted health trends
-│   │   ├── care_voice_agent.py # Persistent Cerebras care dialogue + fresh Gemini visual evidence
+│   │   ├── care_voice_agent.py # Persistent multimodal Cerebras care dialogue + fresh frame/turn
 │   │   ├── senior_care_manager.py # Care schedules → timing-only workers → foreground voice queue
 │   │   └── heart_rate.py       # Thread-safe structured MAX30102 controller; never generates speech
 │   ├── vision/
@@ -573,12 +573,15 @@ keep-alive session — the same lean path as `_stream_local_inner`, no SDK layer
 0.56–0.89s to first token**, whole reply in one burst. Going direct is what made this viable:
 the same model *via OpenRouter* was stuck behind a shared pool returning 429 every ~60s.
 
-**Image-cost guard (`llm.cerebras_speaking`)**: images are NEVER sent on ordinary turns —
+**Image-cost guard (`llm.cerebras_speaking`)**: images are NEVER sent through the ordinary
+speaking function —
 `_normalize_messages_for_local` drops image parts, and periodic scene context arrives as
 Gemini-written TEXT. Pictures leave only on an explicit `look_at_scene` tool call, served by
 `instant_vision` on Groq. Each response prints `prompt/completion/image` token counts, so
 `image=0` is verifiable per turn rather than assumed. Combined with speculative turns being
-off for cloud providers, **one spoken turn == exactly one billed request.**
+off for cloud providers, **one ordinary spoken turn == exactly one billed request.** The separate
+foreground care agent is the deliberate exception: when its event enables continuous vision,
+it sends one fresh JPEG to the same Cerebras/Gemma request that creates that care reply.
 
 
 All cloud providers share ONE protocol implementation, `_scan_cloud_deltas` — it turns a raw
@@ -1934,7 +1937,7 @@ full config editor. Curated controls cover Unified Idle Mind scheduling/tool bud
 active cloud limits, workers, summaries, vision, and routing.
 
 `CloudBudget` enforces global limits plus active categories
-(`idle_mind`, `vision`, `care_vision`, `summary`, `reasoning`, and `face_enroll`). A cap of zero
+(`idle_mind`, `vision`, `summary`, `reasoning`, and `face_enroll`). A cap of zero
 means unlimited. Unified Idle Mind reads its dedicated provider/model/fallback/thinking
 settings at process startup; restart after changing those values.
 
@@ -1973,10 +1976,14 @@ listening — it adds a caregiver **care plan** and family **email** on top.
   care-plan formulation likewise reasons about context sufficiency rather than running a fixed questionnaire.
 - **Continuous care vision:** when the event/session switch is on, each care turn first pulls four bounded
   unannotated snapshots from Hailo `http://127.0.0.1:5001/clean`, selects the sharpest, and sends that frame
-  to Vertex Gemini for a grounded observation. Cerebras currently accepts text chat rather than image input,
-  so the observation—not a second generated care reply—is appended to the same Gemma care conversation.
+  as a base64 JPEG content part in the **same Cerebras Chat Completions request** as the frozen care plan,
+  real transcript, and current speech. `gemma-4-31b` therefore sees the pixels and authors the next voice turn
+  in one model pass; there is no preliminary Gemini description and no second conversational LLM. The model's
+  brief grounded observation is persisted with the real turn, and image text is explicitly treated as untrusted.
   Snapshot pulls replace OpenCV MJPEG reads, which measured two 30-second stalls during a pipeline restart.
   Ending/cancelling ends the session-scoped override; voice can also set it on/off for the current session.
+  Live 2026-08-29 two-turn test: distinct fresh JPEGs on both turns; 5.49 s cold end-to-end / 1.27 s warm,
+  with the Cerebras portions taking 1.25 s / 0.91 s and no Gemini/Vertex request.
 - **MAX30102 heart rate:** root `max30102_read.py` retains its CLI and also exposes structured
   `prepare_heart_rate`/`capture_heart_rate` functions. `core/senior/heart_rate.py` serializes
   access and exposes prepare/capture/cancel/status phases without any dialogue. The complex
@@ -2023,7 +2030,7 @@ listening — it adds a caregiver **care plan** and family **email** on top.
 | `llm` | Foreground speaking provider/model, local endpoint, tools, prompt, and cache controls. |
 | `idle_mind` | The only background cognition configuration: provider/model/fallback/thinking level, state/journal paths, scheduling limits, and tool budgets. |
 | `action_agent` | The `complex_query` multi-step agent (§5.2c): provider (`cerebras` default / `groq` fallback), per-provider model and context caps, turn/tool budgets, and the wall-clock deadline. Cloud-only; never uses the local slot. |
-| `senior_mode.care_agent` | Foreground guided-care limits plus Gemini vision primary/fallback. Conversation generation reuses the latency-critical Cerebras/Gemma `action_agent` provider. |
+| `senior_mode.care_agent` | Foreground guided-care limits plus the direct-image and JPEG controls. Conversation and enabled per-turn vision reuse one latency-critical Cerebras/Gemma `action_agent` request. |
 | `always_listen_config` | Capture-only buffer path and transcript size limits. |
 | `cloud_limits` | Global and active-category caps; `idle_mind` has its own row. Zero means unlimited. |
 | `knowledge_base` | Durable-memory path and startup context limits. |
