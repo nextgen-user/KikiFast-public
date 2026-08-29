@@ -1610,7 +1610,20 @@ async def update_care_plan(section: str, action: str, data: Any = None) -> str:
             "create": "add",
             "update": "edit",
             "delete": "remove",
+            # "start_session"/"begin" is what a model reaches for when asked to
+            # start a routine now. care_session/start is the real spelling; an
+            # unrecognised action just failed, and the agent retried it until
+            # it ran out of turns and its raw JSON was read aloud.
+            "start_session": "start",
+            "begin": "start",
+            "start_now": "start",
         }.get(action, action)
+
+        # Starting a routine on a non-session section is a different tool.
+        if action == "start" and section != "care_session":
+            return ("ERROR: update_care_plan only schedules care for later. To "
+                    "begin a routine RIGHT NOW, call "
+                    "start_care_session(routine=\"<id or part of the title>\").")
 
         d: Dict[str, Any] = {}
         if isinstance(data, dict):
@@ -3166,6 +3179,20 @@ def validate_tool_arguments(name: str, arguments: dict) -> tuple[bool, str]:
 
     schema = fn.get("parameters", {}) or {}
     props = schema.get("properties", {}) or {}
+
+    # Backward compatibility for the compact speaking-tool prompt used before
+    # 2026-08-29. It marked optional parameters by appending "?" directly to
+    # their names (`routine?`), and Gemma copied that marker into JSON twice in
+    # one live care-start attempt. Canonicalize only when stripping the suffix
+    # produces an exact property in THIS tool's schema; arbitrary unknown keys
+    # still fail below, and a real canonical key always wins over its alias.
+    for key in list(arguments):
+        if not isinstance(key, str) or not key.endswith("?"):
+            continue
+        canonical = key[:-1]
+        if canonical in props and canonical not in arguments:
+            arguments[canonical] = arguments.pop(key)
+
     missing = [key for key in schema.get("required", []) if key not in arguments]
     if missing:
         return False, f"missing required argument(s): {', '.join(missing)}"

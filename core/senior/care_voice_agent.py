@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -50,6 +51,74 @@ _LAST_DIRECTIVE: Dict[str, Any] = {
 # session just by omitting or inventing a value.
 _REPLY_REASONS = {"aborted", "incorrect_form", "safety", "choice"}
 
+# Grounded phrases that contradict reply_reason="none". The live model wrote
+# "remained in Pranamasana ... not yet attempting the Haske Stretch" in its
+# visual_observation, then praised the person and advanced anyway. These are
+# deliberately strong phrases, not a generic "not", so benign observations
+# such as "not showing signs of pain" do not trigger a retry.
+_VISUAL_RETRY_RE = re.compile(
+    r"\b(?:did not attempt|didn't attempt|has not attempted|have not attempted|"
+    r"not yet attempt(?:ing|ed)?|has not yet moved|have not yet moved|"
+    r"not performing|not following|failed to (?:attempt|reach|perform)|"
+    r"instead of|rather than|incorrect (?:form|pose|posture)|wrong (?:form|pose|posture)|"
+    r"misaligned)\b",
+    re.IGNORECASE,
+)
+
+
+def _enforce_visual_reply_contract(final: Optional[dict], spoken: str,
+                                   visual_observation: str
+                                   ) -> tuple[Optional[dict], str]:
+    """Do not let a visually admitted failure be praised or advanced past."""
+    if not isinstance(final, dict):
+        return final, spoken
+    reason = str(final.get("reply_reason", "none") or "none").strip().lower()
+    if reason != "none" or not _VISUAL_RETRY_RE.search(
+            str(visual_observation or "")):
+        return final, spoken
+
+    corrected = dict(final)
+    corrected["reply_reason"] = "incorrect_form"
+    corrected["hold_seconds"] = 0
+    hindi = any("\u0900" <= ch <= "\u097f" for ch in str(spoken or ""))
+    retry = (
+        "यह पिछला आसन निर्देश के अनुसार नहीं हुआ। कृपया उसी आसन को एक बार "
+        "फिर सही मुद्रा में कीजिए। क्या आप अभी उसे दोबारा करने के लिए तैयार हैं?"
+        if hindi else
+        "That last asana did not match the instruction. Please repeat the same "
+        "asana in the correct position. Are you ready to try it again now?"
+    )
+    print("[Care] visual observation contradicts reply_reason=none — "
+          "stopping advancement and asking for an immediate retry")
+    return corrected, retry
+
+
+def _ensure_reply_question(final: Optional[dict], spoken: str) -> str:
+    """Every justified listening transition must first ask what to answer."""
+    if not isinstance(final, dict) or "?" in str(spoken or ""):
+        return spoken
+    reason = str(final.get("reply_reason", "none") or "none").strip().lower()
+    if reason not in _REPLY_REASONS:
+        return spoken
+    hindi = any("\u0900" <= ch <= "\u097f" for ch in str(spoken or ""))
+    questions = {
+        "incorrect_form": (
+            "क्या आप उसी आसन को सही मुद्रा में अभी दोबारा करने के लिए तैयार हैं?"
+            if hindi else
+            "Are you ready to repeat that same asana in the correct position now?"),
+        "aborted": (
+            "क्या आप यह अभ्यास यहीं रोकना चाहते हैं?"
+            if hindi else "Do you want to stop the exercise here?"),
+        "safety": (
+            "क्या आपको दर्द, चक्कर या सांस लेने में तकलीफ़ हो रही है?"
+            if hindi else
+            "Are you feeling pain, dizziness, or difficulty breathing?"),
+        "choice": (
+            "आप आगे क्या करना चाहेंगे?"
+            if hindi else "What would you like to do next?"),
+    }
+    return (str(spoken or "").rstrip() + " " + questions[reason]).strip()
+
 
 def get_last_care_directive() -> Dict[str, Any]:
     """Hold/reply intent from the most recent care turn (a copy)."""
@@ -78,12 +147,7 @@ def _set_last_directive(final: Optional[dict], ok: bool,
     if reason != "none" and "?" not in str(spoken or ""):
         print(f"[Care] reply_reason={reason} but no question was asked — "
               f"continuing the routine instead of waiting in silence")
-        if reason in ("safety", "aborted"):
-            # Except when it might matter physically. Listen anyway; a missed
-            # "I feel dizzy" costs more than an awkward pause.
-            print("[Care] ...listening anyway: this reason concerns their safety")
-        else:
-            reason = "none"
+        reason = "none"
 
     _LAST_DIRECTIVE.update({
         "hold_seconds": clamp_hold_seconds(
@@ -232,12 +296,10 @@ not have to talk to keep the routine going. Lead it.
   is real. NEVER count out loud in `summary` — writing "five, four, three, two,
   one" makes TTS say it in two seconds and the person gets no actual time.
   Write "hold it there" and put 5 in `hold_seconds`.
-* After the hold Kiki listens only briefly. If the person says nothing, you get
-  the next turn automatically with a fresh camera frame and
-  `[NO REPLY - CONTINUE THE ROUTINE YOURSELF]`. That is normal and expected —
-  silence means they are exercising. Do NOT ask "are you there?", do not repeat
-  the same instruction, and do not wait. Look at the frame and MOVE ON: the
-  other side, the next repetition, or the next exercise.
+* After the hold, the microphone STAYS MUTED. You get the next turn immediately
+  with photographs taken during that hold and
+  `[NO REPLY - CONTINUE THE ROUTINE YOURSELF]`. Judge whether the PREVIOUS
+  instruction was actually followed before choosing what to say next.
 * Use the frame to correct form, briefly and kindly, then keep going —
   "a little slower, and now over to the left" — rather than stopping to
   discuss it.
@@ -252,17 +314,21 @@ which in `reply_reason`:
 
 - `"aborted"` — they have stopped, walked off, sat down, or are clearly no
   longer participating.
-- `"incorrect_form"` — they are attempting the movement but doing it wrong in a
-  way you already corrected once and they repeated, or wrongly enough that
-  continuing could hurt them.
+- `"incorrect_form"` — the hold frames do not show exactly the movement you just
+  instructed: they stayed in the previous pose, did not attempt it, performed a
+  different pose, or their form is wrong. Correct it immediately, do NOT advance
+  to the next asana, and end with a specific question asking them to retry or
+  confirm readiness.
 - `"safety"` — signs of pain, dizziness, breathlessness, unsteadiness.
 - `"choice"` — you genuinely need a decision (continue or finish, which side
   hurts).
 - `"none"` — everything else. This is the common case. Keep leading.
 
-Someone silently doing the exercise correctly is `"none"`. Someone slightly
-imperfect on the first attempt is `"none"` — correct them in the next
-instruction and keep moving.
+Someone silently doing the instructed exercise correctly is `"none"`: briefly
+acknowledge it and give the next instruction. `"none"` is NOT allowed when your
+own visual_observation says they did not attempt, did not reach, or incorrectly
+performed the previous instruction. Never praise or advance when the visual
+evidence contradicts that.
 
 **Whenever `reply_reason` is not `"none"`, `summary` MUST end with the actual
 question you want answered** — a specific one they can answer in a word:
@@ -366,6 +432,9 @@ async def run_care_voice_turn(user_text: str = "",
             "model returned no separate visual-observation field.")
     elif not images_b64:
         visual_observation = visual_status
+    final, spoken = _enforce_visual_reply_contract(
+        final, spoken, visual_observation)
+    spoken = _ensure_reply_question(final, spoken)
     directive = str((final or {}).get("session", "continue")).strip().lower()
     if directive not in {"continue", "complete", "cancelled", "declined"}:
         directive = "continue"

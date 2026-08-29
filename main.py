@@ -260,6 +260,58 @@ def is_direct_care_complex_call(calls, user_text=""):
         return False
 
 
+def is_successful_care_session_handoff(calls, tool_result):
+    """True when ``start_care_session`` opened the foreground care turn.
+
+    Starting a session is not an ordinary lookup whose result the speaking
+    model should paraphrase. The tool has already queued ``care_session_start``;
+    another local generation here races that event and starts conducting the
+    exercise itself before the care agent gets control.
+    """
+    calls = list(calls or [])
+    if (len(calls) != 1
+            or calls[0].get("name") != "start_care_session"):
+        return False
+    body = str(tool_result or "").strip()
+    prefix = "- start_care_session:"
+    if body.startswith(prefix):
+        body = body[len(prefix):].strip()
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        return False
+    return (isinstance(payload, dict)
+            and payload.get("status") == "care_session_starting"
+            and bool(payload.get("event_id")))
+
+
+def is_speakable_reply(text):
+    """False when a string is machine output rather than something to say.
+
+    The care path hands an agent's answer STRAIGHT to TTS, with no speaking
+    model in between to launder it. So when the action agent ran out of road on
+    2026-08-29 20:04 — it kept retrying an invented `update_care_plan`
+    action="start_session" — its raw turn came back as the answer and Kiki read
+    a JSON object aloud, `{"tool_calls":[{"tool":"update_care_plan"...`, for
+    thirty seconds. Anything that looks like protocol is not a reply.
+    """
+    body = str(text or "").strip()
+    if not body:
+        return False
+    # Structural check by parsing, NOT by first character: a perfectly good
+    # spoken reply often opens with an expression tag — "[gentle] उंगली हटा
+    # दीजिए" — and rejecting every leading bracket silenced real care answers.
+    try:
+        if isinstance(json.loads(body), (dict, list)):
+            return False
+    except (ValueError, TypeError):
+        pass
+    for marker in ('"tool_calls"', '"tool":', '"args":', "<tool_call>"):
+        if marker in body:
+            return False
+    return True
+
+
 def direct_complex_reply(calls, tool_result):
     """Extract one complex agent's finished spoken answer from tool aggregation."""
     calls = list(calls or [])
@@ -269,12 +321,29 @@ def direct_complex_reply(calls, tool_result):
     prefix = "- complex_query:"
     text = text[len(prefix):].strip() if text.startswith(prefix) else text
     failure_marker = "CARE_ACTION_FAILED:"
-    return (text[len(failure_marker):].strip()
+    text = (text[len(failure_marker):].strip()
             if text.startswith(failure_marker) else text)
+    if not is_speakable_reply(text):
+        # Returning "" drops back to normal follow-up generation, which turns
+        # the tool result into real speech instead of reciting it.
+        print("[Care] complex reply was raw agent output, not speech — "
+              "falling back to normal generation")
+        return ""
+    return text
 
 
 def queue_voice_ready_text(tts_streamer, text):
-    """Queue an already-authored reply sentencewise for synth-ahead/low TTFW."""
+    """Queue an already-authored reply sentencewise for synth-ahead/low TTFW.
+
+    Last line of defence for every path that bypasses the speaking model and
+    goes straight to the speaker (care turns, direct complex replies). Callers
+    are expected to have checked; this is here because the cost of being wrong
+    is the person listening to a JSON object.
+    """
+    if not is_speakable_reply(text):
+        print(f"[TTS] refused to speak non-speech output: "
+              f"{str(text or '')[:120]!r}")
+        return 0
     complete, tail = _extract_sentences(str(text or "").strip())
     queued = 0
     for sentence in complete + ([tail] if tail.strip() else []):
@@ -283,6 +352,39 @@ def queue_voice_ready_text(tts_streamer, text):
             tts_streamer.add_sentence(sentence)
             queued += 1
     return queued
+
+
+def drain_stale_input_events(event_queue):
+    """Drop late microphone events without deleting foreground handoffs.
+
+    A successful immediate care start queues ``care_session_start`` while the
+    current tool turn is still playing. The old blanket drain removed it along
+    with stale ASR events, leaving an active persisted session that CareVoice
+    never got to conduct. Preserve control-plane care starts in FIFO order.
+    """
+    preserved = []
+    while not event_queue.empty():
+        try:
+            item = event_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if (isinstance(item, tuple) and item
+                and item[0] == "care_session_start"):
+            preserved.append(item)
+    for item in preserved:
+        event_queue.put_nowait(item)
+    return len(preserved)
+
+
+def should_continue_care_without_listening(
+        guided_care_turn, directive, exercise_enabled, session_active):
+    """True when visual care should advance while the microphone stays muted."""
+    return bool(
+        guided_care_turn
+        and exercise_enabled
+        and session_active
+        and not (directive or {}).get("expect_reply", True)
+    )
 
 
 _SUMMARY_KIND_PREFIX = {
@@ -524,7 +626,7 @@ async def main():
     # person. Bounded so a routine can lead itself through a set of movements
     # without stalling, but can never become Kiki talking to an empty room
     # indefinitely. Any real utterance resets it.
-    care_auto_continues = 0
+    care_visual_continues = 0
     current_system_context = ""
     # Cooperative kill switch for the CURRENT speaking turn's LLM stream(s):
     # the IR push-to-talk barge-in sets it so generation stops the instant the
@@ -1756,9 +1858,9 @@ async def main():
                 print(f"[User] {text}")
                 lcd_manager.display_stream("Question:", text)
                 collected_sentences.append(text)
-                # They spoke, so the routine is not running unattended: give the
-                # auto-continue budget back in full.
-                care_auto_continues = 0
+                # They spoke, so restart the count of consecutive visually
+                # driven care transitions.
+                care_visual_continues = 0
 
                 if idle_mgr is not None:
                     if idle_mgr.is_thinking:
@@ -1926,7 +2028,7 @@ async def main():
                                     "reply during the listening window."),
                     })
                     print(f"[Care] Auto-continuing routine "
-                          f"(no reply; {care_auto_continues} consecutive)")
+                          f"(no reply; {care_visual_continues} consecutive)")
                 elif event == "care_session_start":
                     # The scheduler supplied timing and an event id, never a
                     # fake user utterance. This now follows the exact normal
@@ -2151,6 +2253,7 @@ async def main():
                 tool_turn = False   # a <tool_call> fired and was answered this turn
                 synthetic_tool_followup = False  # deterministic failure reply, not box-generated
                 direct_care_turn = False  # complex care agent already authored speak_text
+                care_session_handoff = False  # start tool queued CareVoice; local turn must stop
                 pending_neck = []
                 pending_tool_calls = None
                 followup_tool_calls = None  # a call emitted by a follow-up generation
@@ -2420,6 +2523,8 @@ async def main():
                                 print(f"[Main] ⚠️ Tool execution timed out after {_exec_timeout}s — continuing without result.")
 
                         tool_result = tool_result_data
+                        care_session_handoff = is_successful_care_session_handoff(
+                            pending_tool_calls.get("calls", []), tool_result)
                         # Observability: log the speaking-path tool call(s) + result
                         # into this turn's session.
                         if _turn_sid:
@@ -2463,7 +2568,8 @@ async def main():
                         # model actually spoke a lead-in (raw_first) — a silent
                         # tool call already gets a TOOL_FILLER above. Round 0
                         # only: a second bridge mid-answer sounds like a stutter.
-                        if (not direct_care_turn and tool_round == 0
+                        if (not direct_care_turn and not care_session_handoff
+                                and tool_round == 0
                                 and TOOL_BRIDGE_ENABLED and TOOL_BRIDGES
                                 and raw_first.strip()):
                             bridge = random.choice(TOOL_BRIDGES)
@@ -2479,7 +2585,16 @@ async def main():
                             if direct_care_turn else "")
                         failure_reply = deterministic_care_plan_failure_reply(
                             pending_tool_calls.get("calls", []), tool_result)
-                        if direct_reply:
+                        if care_session_handoff:
+                            # The tool's foreground hook has queued the real care
+                            # turn. Do not let the local result-follow-up model
+                            # race it and conduct the first exercise step itself.
+                            raw_followup = ""
+                            followup_tool_calls = None
+                            synthetic_tool_followup = True
+                            print("[Care] Session opened — local follow-up suppressed; "
+                                  "handing the next foreground turn to CareVoice.")
+                        elif direct_reply:
                             gestures = extract_neck_tags(direct_reply)
                             if gestures:
                                 pending_neck.extend(gestures)
@@ -2721,6 +2836,87 @@ async def main():
                         oled_manager.set_state("idle")
                     except Exception:
                         pass
+                elif guided_care_turn:
+                    # A physical routine is driven by visual evidence, not by a
+                    # conversational follow-up window. Keep STT muted while the
+                    # person performs the instruction; after the hold, run the
+                    # next care turn over those frames. Only a justified
+                    # reply_reason may open the microphone.
+                    unmute_delay = agent_config.get(
+                        "post_speech_unmute_delay_seconds", 0.35)
+                    print(f"[Main] Speech ended. Waiting {unmute_delay}s before "
+                          "the guided-care transition...")
+                    await asyncio.sleep(unmute_delay)
+
+                    _ex_cfg = {}
+                    _directive = {"expect_reply": True, "reply_reason": "none"}
+                    try:
+                        from core.senior.care_voice_agent import (
+                            get_last_care_directive, _exercise_cfg)
+                        _ex_cfg = _exercise_cfg()
+                        _directive = get_last_care_directive()
+                        _hold = int(_directive.get("hold_seconds", 0))
+                        if (_hold > 0
+                                and _ex_cfg.get("beep_countdown", True)):
+                            lcd_manager.update_status("Hold", f"{_hold}s")
+                            from core.senior.exercise_cadence import play_countdown
+                            from core.vision.instant_vision import (
+                                capture_best_frame_b64)
+                            # Capture the position during the hold. The next care
+                            # turn must judge these before advancing the routine.
+                            _shots = (int(_ex_cfg.get("hold_captures", 2))
+                                      if _ex_cfg.get(
+                                          "capture_during_hold", True) else 0)
+                            await loop.run_in_executor(
+                                None,
+                                lambda: play_countdown(
+                                    _hold, turn_abort_event,
+                                    capture_fn=(capture_best_frame_b64
+                                                if _shots else None),
+                                    max_captures=_shots))
+                    except Exception as _hold_err:
+                        print(f"[Cadence] hold skipped: {_hold_err}")
+
+                    drain_stale_input_events(stt_queue)
+                    try:
+                        from core.senior.care_plan import get_care_plan_store
+                        _care_active = (
+                            get_care_plan_store().care_session_state()
+                            .get("status") == "active")
+                    except Exception:
+                        _care_active = False
+
+                    if ir_idle_requested.is_set() or turn_abort_event.is_set():
+                        print("[Care] Guided transition aborted — returning to idle.")
+                        cancel_mute_timer()
+                        return_to_background_listening()
+                    elif not _care_active:
+                        print("[Care] Session ended — no care reply window needed.")
+                        cancel_mute_timer()
+                        return_to_background_listening()
+                    elif should_continue_care_without_listening(
+                            guided_care_turn, _directive,
+                            _ex_cfg.get("enabled", True), _care_active):
+                        # Correct/common path: never flash Listening and never
+                        # expose an open microphone between asanas.
+                        cancel_mute_timer()
+                        query_listening.clear()
+                        stt.mute()
+                        care_visual_continues += 1
+                        stt_queue.put_nowait(("care_continue", ""))
+                        print("[Care] Form accepted — microphone stays muted; "
+                              f"continuing from vision ({care_visual_continues}).")
+                    else:
+                        # CareVoice named the problem/choice and asked the actual
+                        # question in its spoken turn. Only now should STT open.
+                        _reason = _directive.get("reply_reason", "none")
+                        print(f"[Care] Listening required: reply_reason={_reason}")
+                        print("[Main] Unmuting STT. Listening for care reply...")
+                        lcd_manager.update_status("Listening", "care reply...")
+                        query_listening.set()
+                        stt.set_capture_mode("query")
+                        stt.unmute()
+                        open_listen_window()
                 elif should_skip_followup() or not followups_enabled():
                     hotword_only = not followups_enabled()
                     reason = ("follow-ups disabled" if hotword_only
@@ -2732,109 +2928,14 @@ async def main():
                     unmute_delay = agent_config.get("post_speech_unmute_delay_seconds", 0.35)
                     print(f"[Main] Speech ended. Waiting {unmute_delay}s before unmuting STT to ensure no loopback...")
                     await asyncio.sleep(unmute_delay)
-
-                    # --- Guided exercise: beat out the hold before listening ---
-                    # Still muted here, which is the point: the beeps are loud
-                    # and close to the microphone, and a countdown Kiki
-                    # transcribed as a reply would derail the routine.
-                    care_hold_ran = False
-                    if guided_care_turn:
-                        try:
-                            from core.senior.care_voice_agent import (
-                                get_last_care_directive, _exercise_cfg)
-                            _ex_cfg = _exercise_cfg()
-                            _directive = get_last_care_directive()
-                            _hold = int(_directive.get("hold_seconds", 0))
-                            if _hold > 0 and _ex_cfg.get("beep_countdown", True):
-                                lcd_manager.update_status("Hold", f"{_hold}s")
-                                from core.senior.exercise_cadence import play_countdown
-                                from core.vision.instant_vision import (
-                                    capture_best_frame_b64)
-                                # Photograph the position WHILE it is held. The
-                                # next turn judges form from these rather than
-                                # from a frame taken once the beeps stopped and
-                                # the person had already relaxed.
-                                _shots = (int(_ex_cfg.get("hold_captures", 3))
-                                          if _ex_cfg.get("capture_during_hold", True)
-                                          else 0)
-                                await loop.run_in_executor(
-                                    None,
-                                    lambda: play_countdown(
-                                        _hold, turn_abort_event,
-                                        capture_fn=(capture_best_frame_b64
-                                                    if _shots else None),
-                                        max_captures=_shots))
-                                care_hold_ran = True
-                        except Exception as _hold_err:
-                            print(f"[Cadence] hold skipped: {_hold_err}")
-
-                    # Clear any stale/late-arriving events in the queue before unmuting
-                    while not stt_queue.empty():
-                        try:
-                            stt_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
+                    # Ordinary conversational follow-up (never guided care).
+                    drain_stale_input_events(stt_queue)
                     print("[Main] Unmuting STT. Listening for follow-up...")
                     lcd_manager.update_status("Listening", "follow-up...")
                     query_listening.set()
                     stt.set_capture_mode("query")
                     stt.unmute()
                     open_listen_window()
-
-                    # --- Guided exercise: a short window, then carry on alone ---
-                    # An exercising person answers with their body, not their
-                    # voice. Waiting indefinitely for speech is what turned a
-                    # neck routine into a question-and-answer session where
-                    # every single step needed "okay" before it would advance.
-                    if guided_care_turn and not turn_abort_event.is_set():
-                        try:
-                            from core.senior.care_voice_agent import (
-                                get_last_care_directive, _exercise_cfg)
-                            _ex_cfg = _exercise_cfg()
-                            _directive = get_last_care_directive()
-                            _max_auto = int(_ex_cfg.get("max_auto_continues", 8))
-                            if (_ex_cfg.get("enabled", True)
-                                    and not _directive.get("expect_reply", True)
-                                    and care_auto_continues < _max_auto):
-                                _listen_s = float(
-                                    _ex_cfg.get("reply_listen_seconds", 3.5))
-
-                                async def _continue_if_silent(
-                                        listen_s=_listen_s,
-                                        after_hold=care_hold_ran):
-                                    """Give them a moment to speak; otherwise go on.
-
-                                    Anything the person says lands on stt_queue
-                                    (an interim heartbeat the instant the VAD
-                                    hears them, well before the transcript), so
-                                    a non-empty queue means "they are talking"
-                                    and this must not interrupt.
-                                    """
-                                    await asyncio.sleep(listen_s)
-                                    if not stt_queue.empty() or turn_active:
-                                        return
-                                    if not query_listening.is_set():
-                                        return          # window already closed
-                                    try:
-                                        from core.senior.care_plan import (
-                                            get_care_plan_store)
-                                        if (get_care_plan_store().care_session_state()
-                                                .get("status") != "active"):
-                                            return      # session ended meanwhile
-                                    except Exception:
-                                        return
-                                    stt_queue.put_nowait(("care_continue", ""))
-
-                                care_auto_continues += 1
-                                asyncio.create_task(_continue_if_silent())
-                                print(f"[Care] listening {_listen_s:.1f}s for a reply, "
-                                      f"then continuing on my own "
-                                      f"({care_auto_continues}/{_max_auto})")
-                            elif care_auto_continues >= _max_auto:
-                                print(f"[Care] auto-continue budget spent "
-                                      f"({_max_auto}); waiting for the person now.")
-                        except Exception as _cont_err:
-                            print(f"[Care] auto-continue skipped: {_cont_err}")
     except KeyboardInterrupt:
         pass
     finally:
