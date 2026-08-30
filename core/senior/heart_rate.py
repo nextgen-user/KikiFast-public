@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-from max30102_read import capture_heart_rate, prepare_heart_rate
+from core.hardware.max30102 import capture_heart_rate, prepare_heart_rate
 
 PREPARATION_TTL_SECONDS = 180.0
 

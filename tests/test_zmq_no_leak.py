@@ -4,7 +4,7 @@ Regression test for the ZMQ context/thread leak that exhausted the process.
 Symptom: web-search tool calls (and both their timeouts) hung forever with
 `Resource temporarily unavailable` (EAGAIN) spammed across the log. Root cause
 was NOT search_web — it was per-operation ZMQ leaks:
-  * kiki_control_client.quick_command() (one per neck gesture) created a fresh
+  * core.hardware.controller.quick_command() (one per neck gesture) created a fresh
     zmq.asyncio.Context()+socket but only closed them on the SUCCESS path; when
     the controller was down, recv raised and the context (which owns an OS I/O
     thread + FDs) leaked.
@@ -25,7 +25,7 @@ import asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import kiki_control_client as kcc
+from core.hardware import controller as kcc
 
 
 class _Tracker:

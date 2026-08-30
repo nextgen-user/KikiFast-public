@@ -1,6 +1,6 @@
 """The Phase H daily experiences, expressed as care-plan data rather than code.
 
-The architecture decision this rests on (plan.md, "Non-negotiable"): *a care
+The architecture decision this rests on (docs/SENIOR_CARE_ROADMAP.md, "Non-negotiable"): *a care
 event stores a rich goal/context/session brief, not hardcoded dialogue or an
 executable list of canned instructions. The care agent decides how to conduct
 the session.*

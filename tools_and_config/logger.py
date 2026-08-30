@@ -7,7 +7,7 @@ a timestamp per line. Simple size-based rotation keeps the SD card safe.
 
     "logging": {
       "enabled": true,
-      "file": "/srv/kikifast/logs/kiki.log",
+      "file": "runtime/logs/kikifast.log",
       "max_bytes": 5000000,
       "debug": true          // verbose background prompts/responses and stream stats
     }
@@ -20,6 +20,8 @@ import os
 import sys
 import threading
 from datetime import datetime
+
+from tools_and_config.paths import repo_path, runtime_path
 
 _cfg = {}
 _enabled = False
@@ -91,7 +93,8 @@ def setup_logging(full_config: dict):
     _debug = _cfg.get("debug", False)
     if not _enabled:
         return
-    file_path = _cfg.get("file", "/srv/kikifast/logs/kiki.log")
+    configured_path = _cfg.get("file", str(runtime_path("logs", "kikifast.log")))
+    file_path = str(repo_path(configured_path))
     max_bytes = _cfg.get("max_bytes", 5_000_000)
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     sys.stdout = _Tee(sys.stdout, file_path, max_bytes)

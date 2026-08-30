@@ -7,7 +7,7 @@ This client communicates with hailo_follower_webcam_only.py via ZeroMQ:
 
 Usage:
     import asyncio
-    from kiki_control_client import KikiController
+    from core.hardware.controller import KikiController
     
     async def main():
         controller = KikiController()
@@ -35,7 +35,7 @@ import zmq.asyncio
 # Default configuration (same as server)
 ZMQ_CMD_PORT = 5555
 ZMQ_EVENT_PORT = 5556
-DEFAULT_HOST = "192.0.2.20"  # Change to localhost if running locally
+DEFAULT_HOST = "127.0.0.1"  # Change to localhost if running locally
 
 
 class KikiController:
@@ -511,7 +511,7 @@ async def quick_command(host: str, webcam: Optional[str] = None,
 async def example_usage():
     """Example showing how to use the controller."""
     
-    controller = KikiController(host="192.0.2.20")
+    controller = KikiController(host="127.0.0.1")
     
     if not await controller.connect():
         print("Failed to connect!")
@@ -557,7 +557,7 @@ async def example_usage():
 async def example_training():
     """Example showing how to train a new person."""
     
-    controller = KikiController(host="192.0.2.20")
+    controller = KikiController(host="127.0.0.1")
     
     if not await controller.connect():
         return

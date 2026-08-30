@@ -11,7 +11,7 @@ Runs at rpi boot (kikifast.service) and from the settings-menu Restart:
      and dictate its password with the Pi-local whisper.cpp model.
   5. Loop the boot sound; show live status on the 16x2 LCD + OLED boot animation.
   6. Start the local WhatsApp bridge asynchronously (best effort; never delays boot).
-  7. Ask the laptop server-manager (http://192.0.2.10:8079) to (re)start the three
+  7. Ask the laptop server-manager (http://127.0.0.1:8079) to (re)start the three
      inference servers: llama-server :8080, tts-server :8082, whisper-server :5555.
      The manager always terminates existing instances first, per spec.
   8. (Re)start the local Hailo face/webcam server (hailo_follower.service).
@@ -35,25 +35,30 @@ import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
-KIKIFAST = "/srv/kikifast"
-VENV_PY = "/usr/bin/python3"
-CONFIG = os.path.join(KIKIFAST, "tools_and_config", "config.json")
+_DEFAULT_ROOT = Path(__file__).resolve().parent
+KIKIFAST = str(Path(os.environ.get("KIKIFAST_HOME", _DEFAULT_ROOT)).expanduser().resolve())
+VENV_PY = os.environ.get("KIKIFAST_PYTHON", sys.executable)
+CONFIG = os.environ.get(
+    "KIKIFAST_CONFIG", os.path.join(KIKIFAST, "tools_and_config", "config.json")
+)
+CONFIG_TEMPLATE = os.path.join(KIKIFAST, "tools_and_config", "config.example.json")
 SFX = os.path.join(KIKIFAST, "sound_effects", "soundeffects")
 BOOT_MP3 = os.path.join(SFX, "color-440-sounds-nr-norm-24860.mp3")
 ERROR_MP3 = os.path.join(SFX, "error.mp3")
 
-LAPTOP = "http://192.0.2.10:8079"
+LAPTOP = os.environ.get("KIKIFAST_SERVER_MANAGER_URL", "http://127.0.0.1:8079").rstrip("/")
 LAPTOP_REACH_TIMEOUT = 180   # laptop may still be booting up
 ALL_LIVE_TIMEOUT = 360       # llama model load dominates
 HAILO_PORTS = (5555, 5557)   # ZMQ cmd REP + motor REP, bound by hailo_follower
 
-# Audio/session env (same as the old kiki_startup.sh) so mpv/play work under systemd.
+# Audio/session defaults required for mpv/aplay access under systemd.
 os.environ.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
 os.environ.setdefault("PULSE_SERVER", "unix:/run/user/1000/pulse/native")
 os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
 os.environ.setdefault("DISPLAY", ":0")
-os.environ.setdefault("XAUTHORITY", "~/.Xauthority")
+os.environ.setdefault("XAUTHORITY", os.path.expanduser("~/.Xauthority"))
 
 os.chdir(KIKIFAST)
 sys.path.insert(0, KIKIFAST)
@@ -63,6 +68,11 @@ from core.audio_output import ensure_bluetooth_sink
 
 def log(msg):
     print(f"[boot {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _config_read_path():
+    """Use checked-in defaults until the deployment creates config.json."""
+    return CONFIG if os.path.exists(CONFIG) else CONFIG_TEMPLATE
 
 
 # ---------------------------------------------------------------- displays --
@@ -433,7 +443,7 @@ def _repair_bluetooth_pairing(name, mac, settings, answered=False):
 def _persist_speaker_mac(mac):
     """Save a re-paired speaker's address so the next boot finds it first."""
     try:
-        with open(CONFIG) as f:
+        with open(_config_read_path(), encoding="utf-8") as f:
             saved = json.load(f)
         saved.setdefault("bluetooth_speaker", {})["mac"] = mac
         temp_path = CONFIG + ".tmp"
@@ -526,7 +536,7 @@ def main():
     force = "--force" in sys.argv
 
     try:
-        with open(CONFIG) as f:
+        with open(_config_read_path(), encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception as e:
         fail(f"config: {e}")

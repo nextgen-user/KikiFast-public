@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-whisper_tts.py — low-latency realtime ASR client for whisper.cpp server.
+scripts/diagnostics/whisper_latency.py — low-latency realtime ASR client for whisper.cpp server.
 
 Design (see plan): three decoupled stages so audio capture never blocks on VAD
 or the network.
@@ -17,8 +17,8 @@ we fire the final ASR *in the background* and keep listening. When silence cross
 endpoint_ms we commit using that already-in-flight result. The critical path
 becomes max(endpoint_ms, asr_time) ~= 200-250ms instead of silence_timeout + ASR.
 
-Run live (on the Pi):   python3 whisper_tts.py -u http://HOST:5555/inference
-Benchmark a WAV file:   python3 whisper_tts.py --wav samples/jfk.wav
+Run live (on the Pi):   python3 scripts/diagnostics/whisper_latency.py -u http://HOST:5555/inference
+Benchmark a WAV file:   python3 scripts/diagnostics/whisper_latency.py --wav samples/jfk.wav
 """
 
 import argparse
@@ -49,7 +49,7 @@ FRAME_MS = 1000.0 * FRAME / SAMPLE_RATE
 
 def parse_args():
     p = argparse.ArgumentParser(description="Low-latency realtime mic ASR client (Silero VAD + whisper.cpp).")
-    p.add_argument("-u", "--url", default="http://192.0.2.10:5555/inference", help="Whisper server inference URL")
+    p.add_argument("-u", "--url", default="http://127.0.0.1:5555/inference", help="Whisper server inference URL")
     p.add_argument("-d", "--device", type=str, default=None, help="Audio input device index or name")
     p.add_argument("-lang", "--language", type=str, default="en", help="Language code (default: en)")
     p.add_argument("-vt", "--vad-threshold", type=float, default=0.5, help="Silero speech probability threshold")
@@ -100,9 +100,10 @@ class AsrClient:
 
     def _do(self, wav_bytes, audio_ctx):
         payload = {
-            "response_format": "json",
-            "temperature": "1",
-            "language": "hi",
+            "response_format": "verbose_json",
+            "temperature": "0",
+            "language": "en",
+            "prompt": "Hello, how are you? नमस्ते, आप कैसे हैं?",  # Biases the model strictly toward EN/HI
             "vad": "false",            # client already did VAD; skip the server's loop
             "no_timestamps": "true",   # also disables token_timestamps server-side
             "single_segment": "true",
@@ -315,6 +316,10 @@ def run_wav(args, model, asr):
 
 
 def main():
+    # Force sys.stdout to handle UTF-8 encoding so Devanagari prints correctly
+    if sys.stdout.encoding.lower() != 'utf-8':
+        sys.stdout.reconfigure(encoding='utf-8')
+
     args = parse_args()
     print("Loading Silero VAD model (local CPU)...")
     model = load_silero_vad()

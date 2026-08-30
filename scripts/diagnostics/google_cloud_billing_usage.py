@@ -8,6 +8,7 @@ contain spend or trial-credit information.
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -37,9 +38,12 @@ def money(value, units=0, nanos=0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--key", default="example-project-347dc1f51500.json")
+    parser.add_argument("--key", default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
     parser.add_argument("--project", default=None)
     args = parser.parse_args()
+
+    if not args.key:
+        parser.error("--key or GOOGLE_APPLICATION_CREDENTIALS is required")
 
     with open(args.key, encoding="utf-8") as handle:
         key = json.load(handle)

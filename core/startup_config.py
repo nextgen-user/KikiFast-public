@@ -341,11 +341,13 @@ class StartupConfigWizard:
 
     def _wait_clear(self, timeout_s: float = SENSOR_CLEAR_TIMEOUT_S) -> None:
         """Wait for both sensors to read clear, or declare them stuck."""
+        if self.request is None:
+            return
+        left, right = self._read()
+        if not left and not right:
+            return
         deadline = time.monotonic() + max(0.0, timeout_s)
         while True:
-            left, right = self._read()
-            if not left and not right:
-                return
             if time.monotonic() >= deadline:
                 stuck = " and ".join(
                     name for name, held in
@@ -354,6 +356,9 @@ class StartupConfigWizard:
                 raise SensorsStuckError(
                     f"{stuck} IR sensor still reads held after {timeout_s:g}s")
             time.sleep(POLL_S)
+            left, right = self._read()
+            if not left and not right:
+                return
 
     def _render_choice(self, title: str, options: list[str], index: int) -> None:
         self._show(title, f">> {options[index]}")

@@ -44,7 +44,7 @@ AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 _FORECAST_FIELDS = "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code"
 _AIR_FIELDS = "pm2_5,pm10,us_aqi"
 
-# Freshness lifecycle (plan.md Phase G). A reading is quotable while fresh,
+# Freshness lifecycle (docs/SENIOR_CARE_ROADMAP.md Phase G). A reading is quotable while fresh,
 # quotable-with-an-age while stale, and simply gone after that.
 DEFAULT_POLL_SECONDS = 900          # 15 min; both feeds update at most hourly
 DEFAULT_STALE_SECONDS = 1800        # 30 min

@@ -57,8 +57,8 @@ def test_already_connected_speaker_does_not_reconnect():
 
 
 def test_failed_stale_mac_falls_back_to_paired_name():
-    old_mac = "02:00:00:38:FB:DD"
-    new_mac = "02:00:00:38:FB:DD"
+    old_mac = "02:00:00:00:00:01"
+    new_mac = "02:00:00:00:00:02"
     settings = {
         "name": "Example Speaker",
         "mac": old_mac,

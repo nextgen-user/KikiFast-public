@@ -13,7 +13,7 @@ This module handles layer 2, and is deliberately the same shape as `robot/neck.p
 tags are parsed out of each streamed sentence, stripped before TTS *and* before the
 logging/observability copy, and dispatched asynchronously. The KV-cache contract is
 identical to the neck tags — `message_history` keeps the model's reply VERBATIM with the
-tags in it (see Codestructure.md §4 rule 2); only the spoken/clean copy is stripped.
+tags in it (see docs/ARCHITECTURE.md §4 rule 2); only the spoken/clean copy is stripped.
 
 Unlike neck gestures — which are collected for the whole turn and fired once it ends —
 an expression is fired by the TTS player on the first audible PCM chunk of the sentence

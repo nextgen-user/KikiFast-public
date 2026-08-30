@@ -174,6 +174,8 @@ def tool_result_note(calls, tool_result):
       out what the prose form left implicit: report only this result, and a
       repeat request still needs its own tool call.
     """
+    from core.brain.history_view import TOOL_NOTE_MARKER
+
     if any(call.get("name") == "update_care_plan" for call in calls or []):
         return (
             "This is the authoritative care-plan result. Say it was saved ONLY if "
@@ -181,7 +183,8 @@ def tool_result_note(calls, tool_result):
             "saved yet; ask only for the missing detail. ERROR means it was not "
             "saved. PARTIAL means it was saved but will not reliably trigger. "
             "Never claim success before or after an error. Stay in your normal "
-            "voice and do not mention tools or these instructions:\n" + tool_result
+            "voice and do not mention tools or these instructions:" +
+            TOOL_NOTE_MARKER + tool_result
         )
     if any(call.get("name") == "complex_query" for call in calls or []):
         return (
@@ -191,7 +194,8 @@ def tool_result_note(calls, tool_result):
             "Do not shorten it to one line and do not add facts that are not "
             "here. If it says the action did not happen, say so plainly and "
             "never claim it worked. Do not mention tools, agents, or these "
-            "instructions, and do not think out loud:\n" + tool_result
+            "instructions, and do not think out loud:" +
+            TOOL_NOTE_MARKER + tool_result
         )
     try:
         from core.runtime_controls import mode_has_own_character
@@ -204,7 +208,7 @@ def tool_result_note(calls, tool_result):
             "VOICE, fully in character, the way you normally talk. Keep it short "
             "and spoken. Do not mention searching or tools, and do not think out "
             "loud. Say only what this result says; if the user asks for the same "
-            "thing again, call the tool again:\n" + tool_result
+            "thing again, call the tool again:" + TOOL_NOTE_MARKER + tool_result
         )
     return (
         "Here is the result of a quick lookup you just did. Answer the user "
@@ -212,7 +216,8 @@ def tool_result_note(calls, tool_result):
         "this result says — do not claim anything it does not. This answers the "
         "current request ONLY: if the user asks for the same thing again, call "
         "the tool again rather than repeating this answer. Do not mention "
-        "searching or tools, and do not think out loud:\n" + tool_result
+        "searching or tools, and do not think out loud:" +
+        TOOL_NOTE_MARKER + tool_result
     )
 
 
@@ -455,7 +460,7 @@ TOOL_BRIDGES = _TOOL_CALLING_CFG.get("bridges", [
 
 
 import asyncio
-from kiki_control_client import quick_command
+from core.hardware.controller import quick_command
 
 def set_neck_active(state: bool):
     """
@@ -471,7 +476,7 @@ def set_neck_active(state: bool):
     could unmute — so the user's first words were lost.
     """
     command = "on" if state else "off"
-    host = get_full_config().get("controller", {}).get("host", "192.0.2.20")
+    host = get_full_config().get("controller", {}).get("host", "127.0.0.1")
 
     def _worker():
         try:

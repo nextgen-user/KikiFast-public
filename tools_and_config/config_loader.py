@@ -19,16 +19,27 @@ settings. To make that safe:
 import os
 import json
 import threading
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env
-load_dotenv()
+# Load repository-local environment variables without depending on the caller's
+# working directory.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(_REPO_ROOT / ".env")
 
-# Load config.json
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-CONFIG_PATH = _CONFIG_PATH  # public alias
+_CONFIG_DIR = Path(__file__).resolve().parent
+_DEFAULT_CONFIG_PATH = _CONFIG_DIR / "config.example.json"
+_configured_path = Path(os.environ.get("KIKIFAST_CONFIG", _CONFIG_DIR / "config.json"))
+_CONFIG_PATH = _configured_path if _configured_path.is_absolute() else _REPO_ROOT / _configured_path
+CONFIG_PATH = str(_CONFIG_PATH)  # public alias retained for compatibility
 
-with open(_CONFIG_PATH, "r") as f:
+
+def _read_config_path() -> Path:
+    """Return the user config, or the safe checked-in defaults on first run."""
+    return _CONFIG_PATH if _CONFIG_PATH.exists() else _DEFAULT_CONFIG_PATH
+
+
+with _read_config_path().open("r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
 # Top-level blocks whose changes take effect LIVE (no restart). Everything else is
@@ -103,7 +114,7 @@ def reload_config():
     """Re-read config.json from disk, merge in place, fire listeners.
     Returns (ok: bool, error: str|None)."""
     try:
-        with open(_CONFIG_PATH, "r") as f:
+        with _read_config_path().open("r", encoding="utf-8") as f:
             fresh = json.load(f)
     except Exception as e:
         return False, f"parse error: {e}"
@@ -123,8 +134,9 @@ def save_config(new_config: dict = None) -> bool:
     data = new_config if new_config is not None else CONFIG
     with _save_lock:
         try:
-            tmp = _CONFIG_PATH + ".tmp"
-            with open(tmp, "w") as f:
+            _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _CONFIG_PATH.with_suffix(_CONFIG_PATH.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             os.replace(tmp, _CONFIG_PATH)
             return True

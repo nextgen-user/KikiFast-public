@@ -28,7 +28,7 @@ def test_parse_nmcli_networks_unescapes_sorts_and_deduplicates():
 
 def test_parse_nmcli_network_keeps_bssid_for_reliable_connection():
     networks = parse_nmcli_networks(
-        r":46\:CD\:6C\:CF\:B8\:9F:Galaxy:100:WPA2" "\n"
+        r":02\:00\:00\:38\:FB\:DD:Galaxy:100:WPA2" "\n"
     )
 
     assert networks == [
@@ -79,7 +79,7 @@ def test_visible_preferred_hotspot_is_not_duplicated():
         "_run_nmcli",
         side_effect=[
             completed([], 0, "", ""),
-            completed([], 0, ":11\\:22\\:33\\:44\\:55\\:66:ExampleNet:88:WPA2\n", ""),
+            completed([], 0, ":02\\:00\\:00\\:38\\:FB\\:DD:ExampleNet:88:WPA2\n", ""),
         ],
     ):
         networks = setup.scan()

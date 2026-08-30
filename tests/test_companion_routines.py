@@ -1,6 +1,6 @@
 """Phase H experiences are care-plan DATA, not code paths.
 
-The architecture decision these tests defend (plan.md, "Non-negotiable"): a care
+The architecture decision these tests defend (docs/SENIOR_CARE_ROADMAP.md, "Non-negotiable"): a care
 event stores a rich goal/context/session brief, not hardcoded dialogue or an
 executable list of canned instructions. So the assertions below are as much
 about what the briefs must NOT contain -- a script, a question list, a fixed

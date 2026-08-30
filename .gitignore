@@ -1,34 +1,68 @@
-__pycache__/
-*.pyc
+# Secrets and local configuration
 .env
-conversations/
-conversation_summary.txt
-thinking_journal.json
-ambient_listen_buffer.json
-knowledge_base.json
-workers.json
-image.jpeg
-*.wav
-!sound_effects/soundeffects/startup_config_beep.wav
-*.cache
-tools_and_config/lcd_sync_calibration.json
-*.log
-*.pid
-.tiktoken_cache/
-care_plan.json
+.env.*
+!.env.example
+tools_and_config/config.json
+tools_and_config/config.*.json
+!tools_and_config/config.example.json
+*service-account*.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
 
-# Machine-written files: these change without anyone editing them, so their
-# worktree copy drifts from whatever git has committed. That is the class that
-# turned a brownout into unrecoverable object-DB loss on 2026-07-30 — a lost
-# blob for a source file can always be restored from disk with
-# `git hash-object -w`, but not one whose content has since been rewritten.
-# Keep them untracked so a power cut can only ever cost recoverable data.
-*.log.*
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Runtime state and personal data
+runtime/
 logs/
-*.jsonl
+conversations/
 kiki_speeches/
+faces/
+birthday_cache/
+film_cache/
+whatsapp-mcp/whatsapp-bridge/store/
+core/senior/_cadence_cache/
+integrations/webrtc/recordings/
+ambient_listen_buffer.json
+care_plan.json
+conversation_summary.txt
+idle_mind_state.json
+knowledge_base.json
+liked_songs.json
+relationship_state.json
+thinking_journal.json
+workers.json
 
-# Downloaded toolchains/archives — refetchable, and a 62MB blob makes every
-# `git gc` repack a long window of writing on an SD card.
-/go*.tar.gz
-*.tar.gz
+# Generated and temporary files
+*.bak
+*.bak-*
+*.cache
+*.jsonl
+*.log
+*.log.*
+*.pid
+*.tmp
+.tiktoken_cache/
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*~

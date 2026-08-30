@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -19,8 +20,9 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple, List
 
 from tools_and_config.config_loader import get_full_config
+from tools_and_config.paths import REPO_ROOT
 import asyncio
-from kiki_control_client import quick_command
+from core.hardware.controller import quick_command
 from core.observability import get_recorder
 from core.gesture_controls import (
     activity_generation,
@@ -52,10 +54,10 @@ def set_neck_active(state: bool):
 
     Never controlled chassis wheels — enables/disables the controller's autonomous
     neck-tracking (`neck_movement` on/off). Safe to call from synchronous background
-    threads. (Chassis tools that used to call this are parked in to_do/chassis_tools.py.)
+    threads. Legacy chassis tools are intentionally not part of the public runtime.
     """
     command = "on" if state else "off"
-    host = get_full_config().get("controller", {}).get("host", "192.0.2.20")
+    host = get_full_config().get("controller", {}).get("host", "127.0.0.1")
     try:
         asyncio.run(quick_command(host=host, neck_movement=command))
         print(f"[Neck] Neck tracking set to {command.upper()} via KikiController")
@@ -68,9 +70,10 @@ _controller = None
 _controller_lock = asyncio.Lock()
 
 # NOTE: The chassis motor client (KikiMotorClient / VALID_MOTOR_ACTIONS / :5557) and the
-# move/dance/follow_me tools were parked in to_do/chassis_tools.py when Kiki became a
+# Legacy move/dance/follow_me tools were removed when Kiki became a
 # stationary neck-only unit. Kiki's only motion now is neck rotation — see robot/neck.py
-# (expressive tags) and track_person (gaze). Re-add from to_do/ if wheels return.
+# (expressive tags) and track_person (gaze). Reintroduce them behind a dedicated
+# hardware adapter if wheel control returns.
 
 
 # Web-search bound. The Exa SDK runs a blocking `requests` call with no timeout
@@ -156,10 +159,10 @@ async def _get_controller():
     global _controller
     async with _controller_lock:
         if _controller is None or not _controller._connected:
-            from kiki_control_client import KikiController
+            from core.hardware.controller import KikiController
             config = get_full_config()
             ctrl_config = config.get("controller", {})
-            host = ctrl_config.get("host", "192.0.2.20")
+            host = ctrl_config.get("host", "127.0.0.1")
             _controller = KikiController(host=host)
             connected = await _controller.connect()
             if not connected:
@@ -800,11 +803,11 @@ async def execute_python_code(code: str) -> str:
         result = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: subprocess.run(
-                ["/usr/bin/python3", "-c", code],
+                [sys.executable, "-c", code],
                 capture_output=True,
                 text=True,
                 timeout=30,
-                cwd="/srv/kikifast"
+                cwd=str(REPO_ROOT)
             )
         )
         output = ""
@@ -1027,9 +1030,10 @@ def _whatsapp_image_config() -> tuple[bool, int, float]:
             max(1.0, float(cfg.get("describe_images_timeout", 7.0))))
 
 
-_MEDIA_ROOT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "whatsapp-mcp", "whatsapp-bridge", "store")
+_MEDIA_ROOT = os.environ.get(
+    "KIKIFAST_WHATSAPP_STORE",
+    str(REPO_ROOT / "integrations" / "whatsapp-mcp" / "whatsapp-bridge" / "store"),
+)
 _MESSAGES_DB = os.path.join(_MEDIA_ROOT, "messages.db")
 
 
@@ -2305,7 +2309,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_shell_command",
-            "description": "Execute a shell command. Useful for checking system status like temperature, disk space, etc.Install all python packagaes in  /usr/bin/python3 venv.",
+            "description": "Execute a shell command. Useful for checking system status like temperature, disk space, etc.Install all python packagaes in  python venv.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2628,7 +2632,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_python_code",
-            "description": "Execute Python code in a subprocess and return the output. Useful for calculations, data processing, file operations, or any task that benefits from code execution.All python code in run in the /usr/bin/python3 venv.",
+            "description": "Execute Python code in a subprocess and return the output. Useful for calculations, data processing, file operations, or any task that benefits from code execution.All python code in run in the python venv.",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -14,7 +14,7 @@ This module handles layer 2. Tags are parsed out of the streamed reply, the surr
 text is stripped before TTS *and* before the history append (KV-cache rule: the history
 stores the stripped text), and the gestures are applied asynchronously via the controller.
 
-Replaces the old `robot/movement.py` chassis-tag path (now parked in `to_do/`). The tag
+Replaces the retired chassis-tag path. The tag
 shape mirrors the old one so `main.py`'s plumbing stays the same — only neck-only now.
 """
 
@@ -56,11 +56,11 @@ def apply_neck(gestures: list):
     if not gestures:
         return
 
-    host = get_full_config().get("controller", {}).get("host", "192.0.2.20")
+    host = get_full_config().get("controller", {}).get("host", "127.0.0.1")
 
     def _worker():
         try:
-            from kiki_control_client import quick_command
+            from core.hardware.controller import quick_command
             for g in gestures:
                 direction = g.get("direction", "center")
                 steps = g.get("steps")

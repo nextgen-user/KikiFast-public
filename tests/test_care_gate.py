@@ -7,12 +7,13 @@ something that must NOT fire.
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
-_GATE_PATH = Path("/srv/kikifast-navigation/care_gate.py")
+_GATE_PATH = Path(os.environ.get("KIKIFAST_CARE_GATE_PATH", "care_gate.py"))
 pytestmark = pytest.mark.skipif(
     not _GATE_PATH.is_file(), reason="care_gate.py lives in the un-versioned Hailo tree")
 
@@ -25,7 +26,7 @@ def _load_module():
     return module
 
 
-care_gate = _load_module()
+care_gate = _load_module() if _GATE_PATH.is_file() else None
 
 DRINK = "person raising a cup or bottle to their mouth"
 PHONE = "person holding a phone to their ear"

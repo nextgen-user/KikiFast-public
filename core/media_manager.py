@@ -159,7 +159,7 @@ class MusicManager:
 
     @staticmethod
     def _yt_dlp(config: dict) -> str:
-        configured = config.get("yt_dlp_path", "/srv/kikifast/.venv/bin/yt-dlp")
+        configured = config.get("yt_dlp_path", "yt-dlp")
         if os.path.isfile(configured) and os.access(configured, os.X_OK):
             return configured
         return shutil.which("yt-dlp") or configured

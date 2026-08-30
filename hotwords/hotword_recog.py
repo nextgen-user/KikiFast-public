@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import threading
+from pathlib import Path
 import numpy as np
 import pyaudio
 import openwakeword
@@ -10,7 +11,7 @@ from openwakeword.model import Model
 class HotwordRecognizer:
     def __init__(self, device_index=2):
         """
-        Initialize the Hotword Recognizer (OpenWakeWord, kiki.onnx).
+        Initialize the Hotword Recognizer (OpenWakeWord, assets/models/kiki.onnx).
 
         :param device_index: PyAudio input device index. Falls back to default if invalid.
         """
@@ -36,9 +37,10 @@ class HotwordRecognizer:
         self.resume_quiet_frames = 3
         self.resume_max_wait = 2.5   # hard cap so a noisy room still resumes
         
-        # Load the kiki.onnx model
+        # Load the assets/models/kiki.onnx model
+        model_path = Path(__file__).resolve().parents[1] / "assets" / "models" / "assets/models/kiki.onnx"
         self.owwModel = Model(
-            wakeword_models=["/srv/kikifast/kiki.onnx"],
+            wakeword_models=[str(model_path)],
             vad_threshold=self.vad_threshold,
             inference_framework=self.inference_framework,
         )

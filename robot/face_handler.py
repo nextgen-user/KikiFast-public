@@ -30,9 +30,9 @@ async def face_event_listener(
         max_injections = int(face_config.get("max_injections_per_5min", 2))
 
         try:
-            from kiki_control_client import KikiController
+            from core.hardware.controller import KikiController
             ctrl_config = config.get("controller", {})
-            controller = KikiController(host=ctrl_config.get("host", "192.0.2.20"))
+            controller = KikiController(host=ctrl_config.get("host", "127.0.0.1"))
 
             connected = await controller.connect()
             if not connected:
@@ -213,7 +213,7 @@ async def face_event_listener(
                     hot_inject(message_history, {"role": "system", "content": msg})
 
         except ImportError:
-            print("[Face] kiki_control_client not available")
+            print("[Face] hardware controller client not available")
             break # No point retrying if file is missing
         except Exception as e:
             print(f"[Face] Event listener error: {e}. Retrying in 5s...")

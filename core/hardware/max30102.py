@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """MAX30102 heart rate + SpO2 over the Raspberry Pi's I2C-1 bus.
 
-    python3 max30102_read.py            # fingertip (default)
-    python3 max30102_read.py --wrist    # wrist preset
-    python3 max30102_read.py --seconds 20 --led 0x40
+    python3 -m core.hardware.max30102            # fingertip (default)
+    python3 -m core.hardware.max30102 --wrist    # wrist preset
+    python3 -m core.hardware.max30102 --seconds 20 --led 0x40
 
 Reports a signal-quality verdict alongside the numbers and refuses to print a
 reading it does not trust. SpO2 is UNCALIBRATED -- see the closing note.

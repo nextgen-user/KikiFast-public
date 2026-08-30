@@ -1,4 +1,4 @@
-# KikiFast dependencies — versions pinned from the production venv (/srv/kikifast/.venv)
+# KikiFast dependencies — versions pinned from the production venv (the active virtual environment)
 python-dotenv==1.2.1
 requests==2.32.5
 numpy==2.2.6

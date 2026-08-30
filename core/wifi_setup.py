@@ -59,8 +59,8 @@ CLEAR_HOLD_S = 1.0
 BACK_HOLD_S = 1.2
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WHISPER_CLI = os.path.join(ROOT, "whisper.cpp", "build", "bin", "whisper-cli")
-WHISPER_MODEL = os.path.join(ROOT, "whisper.cpp", "models", "ggml-base.en.bin")
+WHISPER_CLI = os.environ.get("KIKIFAST_WHISPER_CLI", "whisper-cli")
+WHISPER_MODEL = os.environ.get("KIKIFAST_WHISPER_MODEL", "ggml-base.en.bin")
 WHISPER_PROMPT = (
     "A Wi-Fi password dictated one character at a time. "
     "Example: k i k i. Say capital before or after a capital letter. "
