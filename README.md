@@ -50,7 +50,7 @@ and rewarm the conversation prefix to reduce response latency.
 | `integrations/` | Optional standalone integrations |
 | `scripts/` | Diagnostics, demos, and operational utilities |
 | `tests/` | Automated checks for the included components |
-| `docs/` | Project notes and supporting documentation |
+| `docs/` | High-level architecture, handoff, roadmap, and feature documentation |
 
 ## Requirements
 
