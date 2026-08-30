@@ -90,7 +90,7 @@
       "set_timer",
       "complex_query"
     ],
-    "_main_tools_comment": "The curated set the SPEAKING model sees; every name here costs tokens in the warm KV-cache prefix on every single turn. The 12 WhatsApp tools were deliberately REMOVED from this list (they remain in tools.TOOLS for agents): they bloated the prefix, and the speaking model can only emit ONE tool call per turn, so it could never actually complete a WhatsApp task like 'check the group and set a reminder'. Those requests now go to complex_query, which runs the whole multi-step job on the cloud action agent (core/brain/action_agent.py). Same two-trigger shape as look_at_scene: the model can emit complex_query itself, AND core/llm.py._auto_complex_query_tool_event routes unmistakable requests in code so a missed decision by the small model cannot become a confident 'I sent it' hallucination.",
+    "_main_tools_comment": "Tools available to the primary runtime.",
     "tool_calling": {
       "enabled": true,
       "speak_filler": true,
@@ -153,7 +153,7 @@
     "active_on_startup": "senior",
     "followups_enabled_on_startup": true,
     "volume_step_percent": 10,
-    "_persona_reinforce_comment": "WHY THIS EXISTS (measured on the box, 2026-07-27, gemma-4-26B-A4B-it-UD-IQ3_S — the SAME gguf that plays the character perfectly in a bare chat window). A mode's system_prompt REPLACES llm.system_prompt, so a short character prompt like 'rohan' is all the personality in context. Bisecting the real runtime prompt one layer at a time with the user saying 'Hi!': bare rohan (74 prompt tokens) = fully in character, identical to a bare chat; + the hindi suffix = still in character; + the TTS tag restriction (275 tok) = thinner; + the ## TOOLS instruction (840 tok) = PERSONA GONE, a generic 'namaste, kya haal hain'; + the memory context (3570 tok) = a plain assistant. The tools block is 2159 chars of imperative protocol that _normalize_messages_for_local used to CONCATENATE onto the end of the same system message, so it was both ~90% of that message AND the most recent text in it — the character was outnumbered and out-positioned at once. Fix (variant C of four tested): move the protocol into its own system message, and repeat the character in a final system message AFTER the memory context, so the last thing before the conversation is who you are rather than how to emit a tool call. That restored the exact bare-chat voice at full 3.7k-token context ('Yo! What's up? You caught me mid-scroll... my attention span is cooked') and it still HOLDS six turns later. Position is FIXED at the end of the leading system block, never per-turn, so section 4's KV-cache contract is intact. custom_prompt_modes_only=true leaves 'default' untouched: its own 7.9k prompt already carries these rules and duplicating it would just cost prefix tokens.",
+    "_persona_reinforce_comment": "Optional prompt reinforcement for custom modes.",
     "persona_reinforce": {
       "enabled": false,
       "custom_prompt_modes_only": true,
@@ -631,7 +631,7 @@
     "max_action_calls": 2
   },
   "action_agent": {
-    "_comment": "The fast research+action agent behind the complex_query tool (core/brain/action_agent.py). Cloud-only: it NEVER uses the local llama.cpp slot, so the speaking path is untouched. It is not the idle mind (that one optimises quality over seconds) and not the speaking brain.",
+    "_comment": "Optional multi-step task routing settings.",
     "enabled": true,
     "_provider_comment": "MEASURED on this Pi, 2026-07-26, with a realistic 4-turn agent loop (tests/bench_action_agent.py). CEREBRAS gemma-4-31b: 3.07s for the whole loop, ~0.75s/turn warm, one clean JSON object per turn, zero 429s, and it reports cached_tokens so resending the conversation is cheap. CEREBRAS gpt-oss-120b: 2.88s but it does NOT stop after its first JSON object — it fabricates its own tool results and keeps going (~3x the output tokens), which fast_cloud.first_json_object has to truncate. GROQ openai/gpt-oss-120b: 5.83s AND it 429'd on turn 4 of a SINGLE query — each key is 8000 tokens/MINUTE (confirmed via x-ratelimit-limit-tokens; a token bucket refilling in ~24s, not a daily cap), and one complex query is roughly one whole key's minute. That is why Groq is the FALLBACK, not the default, and why it gets a compacted prompt while Cerebras gets the full context. Note Groq's pool is SHARED with instant_vision/look_at_scene.",
     "provider": "cerebras",
@@ -668,7 +668,7 @@
     "_deadline_comment": "Wall-clock ceiling for one complex_query, enforced INSIDE the agent via the shared run_agent_loop stop_event (checked between turns and before every tool call). Must stay below llm.tool_calling.exec_timeout_overrides.complex_query so the agent reports partial progress itself rather than being cut off by main.py mid-action.",
     "deadline_seconds": 22.0,
     "summary_max_chars": 2000,
-    "_context_comment": "What the agent knows beyond the bare request. The code router builds its tool call from the user's WORDS ONLY, so without these 'send it to him' or 'send the music link' arrive with no referent. Read out-of-band from core.llm (_CONVERSATION_SNAPSHOT / persona_brief), NEVER passed as a tool argument: arguments become assistant text that register_history writes into the speaking prefix, so putting the conversation there would re-prefill the box on every routed turn and break the KV-cache contract in section 4.",
+    "_context_comment": "Limits for optional conversational context supplied to tool-enabled workflows.",
     "_history_chars_comment": "~7000 tokens, deliberately matched to agent.token_limit — the ceiling the LOCAL speaking model runs against. The box model was seeing the ENTIRE message_history (system rows, tool results and all) while this cloud agent got 1800 chars of user/assistant text, so the 3B-class model on the Pi was ~14x better informed than the agent built to act on what it heard. Kiki's history only approaches this size just before a compaction, so in the common case the agent now gets 100% of it; the cap keeps the NEWEST records, which is what pronouns point at.",
     "history_chars": 28000,
     "history_record_chars": 1200,

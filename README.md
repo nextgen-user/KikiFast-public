@@ -43,14 +43,14 @@ and rewarm the conversation prefix to reduce response latency.
 |---|---|
 | `main.py` | Primary voice-loop entry point |
 | `kiki_boot.py` | Raspberry Pi boot and service orchestration |
-| `core/` | Runtime, brain, health, care, vision, worker, and hardware modules |
+| `core/` | Runtime-facing health, vision, hardware, and device modules |
 | `tools_and_config/` | Safe configuration template, logging, paths, and tool dispatch |
 | `robot/`, `hotwords/` | Robot-facing and wake-word adapters |
 | `webui/` | Local operations dashboard |
 | `integrations/` | Optional standalone integrations |
-| `scripts/` | Diagnostics, demos, benchmarks, and operational utilities |
-| `tests/` | Maintained automated tests |
-| `docs/` | [Architecture](docs/ARCHITECTURE.md), [senior-care roadmap](docs/SENIOR_CARE_ROADMAP.md), and feature notes |
+| `scripts/` | Diagnostics, demos, and operational utilities |
+| `tests/` | Automated checks for the included components |
+| `docs/` | Project notes and supporting documentation |
 
 ## Requirements
 
@@ -144,10 +144,6 @@ python -m pytest
 Tests isolate writable care state with temporary directories. Tests requiring
 an unversioned Hailo `care_gate.py` skip automatically unless
 `KIKIFAST_CARE_GATE_PATH` is set.
-
-Live llama.cpp latency and cache experiments are intentionally separated from
-the default suite under `scripts/benchmarks/llama_server/`. They require running
-services and should be invoked explicitly as modules.
 
 ## Security and privacy
 
